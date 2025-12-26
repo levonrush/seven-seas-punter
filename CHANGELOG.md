@@ -21,3 +21,4 @@ All notable changes to this project will be documented in this file.
 - Added split-date support for train/backtest/pipeline commands to keep evaluations out-of-sample.
 - Switched calibration to explicit holdout isotonic/Platt scaling with group-aware splits to reduce market leakage.
 - Fixed test fixtures for expected value math and optional results handling.
+- Added auto-report output after training/pipeline, with `--no-report` to suppress.

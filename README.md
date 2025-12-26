@@ -80,13 +80,13 @@ pytest
 One wrapper to run individual steps or a full pipeline:
 ```bash
 # Ingest stream tar, build features, train, backtest, and score (dry-run scoring by default)
-punter pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run
+punter pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report; use --no-report
 
 # Or run individual subcommands:
 punter ingest --archive data/data.tar
 punter ingest --archive data/data.tar --workers 6  # override auto-parallelism
 punter features --cutoff-minutes 10
-punter train --cutoff-minutes 10 --split-date 2023-01-01
+punter train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
 punter backtest --cutoff-minutes 10 --split-date 2023-01-01
 punter score --cutoff-minutes 10 --dry-run
 punter status
@@ -95,7 +95,7 @@ punter quickstart --cutoff-minutes 10
 ```
 If you haven't installed the editable package, you can still run:
 ```bash
-python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --dry-run
+python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report; use --no-report
 ```
 
 ## Notes
@@ -107,13 +107,13 @@ python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --dry-run
 ## Unified CLI (`punter`)
 From repo root:
 ```bash
-python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --dry-run
+python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run
 ```
 Or individual steps:
 ```bash
 python punter.py ingest --archive data/data.tar
 python punter.py features --cutoff-minutes 10
-python punter.py train --cutoff-minutes 10 --split-date 2023-01-01
+python punter.py train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
 python punter.py backtest --cutoff-minutes 10 --split-date 2023-01-01
 python punter.py score --cutoff-minutes 10 --dry-run
 python punter.py status  # show table row counts
@@ -122,7 +122,7 @@ python punter.py status  # show table row counts
 python punter.py quickstart --cutoff-minutes 10
 
 # Pipeline with download instead of archive
-python punter.py pipeline --download-date 2024-01-01 --cutoff-minutes 10 --dry-run
+python punter.py pipeline --download-date 2024-01-01 --cutoff-minutes 10 --split-date 2023-01-01 --dry-run
 # Skip parts of the pipeline if you already have them:
 #   --skip-features / --skip-train / --skip-backtest / --skip-score
 ```

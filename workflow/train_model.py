@@ -20,6 +20,12 @@ def main() -> None:
         "--split-date",
         help="ISO date/time; training uses races strictly before this (leakage-safe split).",
     )
+    parser.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a report summary after training.",
+    )
     args = parser.parse_args()
 
     log(f"Train: cutoff T-{args.cutoff_minutes}")
@@ -40,6 +46,10 @@ def main() -> None:
         split_date=args.split_date,
     )
     log(f"Model saved to {model_path}, calibrator to {calibrator_path}, metrics={metrics}")
+    if args.report:
+        from workflow.cli import cmd_report
+
+        cmd_report(argparse.Namespace())
 
 
 if __name__ == "__main__":

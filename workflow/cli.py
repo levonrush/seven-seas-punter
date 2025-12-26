@@ -89,6 +89,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         split_date=getattr(args, "split_date", None),
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
+    if getattr(args, "report", False):
+        cmd_report(args)
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
@@ -295,6 +297,9 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
         log("Step: score")
         args.output = args.output or f"artifacts/pipeline_score_cutoff_{args.cutoff_minutes}.csv"
         cmd_score(args)
+    if getattr(args, "report", False):
+        log("Step: report")
+        cmd_report(args)
     log("Pipeline complete.")
 
 
@@ -326,6 +331,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument(
         "--split-date",
         help="ISO date/time; training uses races strictly before this (leakage-safe split).",
+    )
+    p_train.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a report summary after training.",
     )
     p_train.set_defaults(func=cmd_train)
 
@@ -366,6 +377,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-date",
         help="ISO date/time; train uses races before this, backtest uses on/after.",
     )
+    p_pipe.add_argument(
+        "--report",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a report summary after the pipeline completes.",
+    )
     p_pipe.add_argument("--output")
     p_pipe.add_argument("--dry-run", action="store_true", help="Applied to scoring step")
     p_pipe.add_argument("--skip-features", action="store_true")
@@ -395,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
                 skip_train=False,
                 skip_backtest=False,
                 skip_score=False,
+                report=True,
             )
         )
     )
