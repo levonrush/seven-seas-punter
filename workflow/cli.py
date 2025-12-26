@@ -59,8 +59,13 @@ def cmd_features(args: argparse.Namespace) -> None:
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
     output_path = pathlib.Path("data") / f"features_cutoff_{args.cutoff_minutes}.parquet"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(output_path, index=False)
-    log(f"Wrote features to {output_path} ({len(features)} rows).")
+    try:
+        features.to_parquet(output_path, index=False)
+        log(f"Wrote features to {output_path} ({len(features)} rows).")
+    except ImportError as exc:
+        csv_path = output_path.with_suffix(".csv")
+        features.to_csv(csv_path, index=False)
+        log(f"Parquet engine missing ({exc}); wrote CSV to {csv_path} ({len(features)} rows).")
 
 
 def cmd_train(args: argparse.Namespace) -> None:

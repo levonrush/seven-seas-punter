@@ -11,4 +11,5 @@ All notable changes to this project will be documented in this file.
 - Improved elapsed-time logs to show seconds/minutes/hours as needed.
 - Added ingest short-circuit when snapshots already exist, with `--force-ingest` to override.
 - Added CSV fallback when parquet engine is missing during feature export.
+- Added CSV fallback for CLI feature export when parquet engine is missing.
 - Added “blind coding” banter to README.
