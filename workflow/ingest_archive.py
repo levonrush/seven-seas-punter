@@ -378,6 +378,11 @@ def main() -> None:
         action="store_true",
         help="If set, only keep AU horse racing WIN markets during ingest.",
     )
+    parser.add_argument(
+        "--force-ingest",
+        action="store_true",
+        help="Re-ingest even if snapshots already exist in DuckDB.",
+    )
     args = parser.parse_args()
 
     log(
@@ -388,6 +393,13 @@ def main() -> None:
         raise FileNotFoundError(f"Archive not found: {archive_path}")
 
     store = DuckDBStore()
+
+    if not args.force_ingest and store.has_data("snapshots"):
+        existing = store.table_row_count("snapshots")
+        log(
+            f"Ingest: snapshots already present ({existing} rows); skipping ingest. Use --force-ingest to re-run."
+        )
+        return
 
     counts = ingest_archive_file(
         archive_path,

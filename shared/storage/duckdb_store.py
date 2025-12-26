@@ -243,3 +243,12 @@ class DuckDBStore:
         """Return stored runners for joins."""
         with self._connect() as con:
             return con.execute("SELECT * FROM runners").df()
+
+    def table_row_count(self, table: str) -> int:
+        """Return table row count so ingest steps can skip reprocessing when data already exists."""
+        with self._connect() as con:
+            return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def has_data(self, table: str = "snapshots") -> bool:
+        """Return True if the table has at least one row, to short-circuit expensive ingests."""
+        return self.table_row_count(table) > 0

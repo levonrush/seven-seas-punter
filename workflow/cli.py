@@ -14,6 +14,12 @@ from workflow.ingest_archive import ingest_archive_file
 def cmd_ingest(args: argparse.Namespace) -> None:
     """Ingest a tar archive (Betfair stream .bz2 or tabular CSV/Parquet) into DuckDB."""
     store = DuckDBStore()
+    if not args.force_ingest and store.has_data("snapshots"):
+        existing = store.table_row_count("snapshots")
+        log(
+            f"Ingest: snapshots already present ({existing} rows); skipping ingest. Use --force-ingest to re-run."
+        )
+        return
     counts = ingest_archive_file(
         pathlib.Path(args.archive),
         store,
@@ -227,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--progress-every", type=int, default=100)
     p_ingest.add_argument("--workers", type=int, default=None, help="Parallel workers for stream ingest")
     p_ingest.add_argument("--filter-au-win", action="store_true", help="Only keep AU WIN markets")
+    p_ingest.add_argument("--force-ingest", action="store_true", help="Re-ingest even if data exists")
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_dl = sub.add_parser("download", help="Download markets/snapshots for a date (or dry-run)")
@@ -265,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--progress-every", type=int, default=100, help="File progress print frequency")
     p_pipe.add_argument("--workers", type=int, default=None, help="Parallel workers for stream ingest")
     p_pipe.add_argument("--filter-au-win", action="store_true", help="Only keep AU WIN markets")
+    p_pipe.add_argument("--force-ingest", action="store_true", help="Re-ingest even if data exists")
     p_pipe.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_pipe.add_argument("--commission", type=float, default=0.05)
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
