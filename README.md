@@ -87,7 +87,7 @@ punter ingest --archive data/data.tar
 punter ingest --archive data/data.tar --workers 6  # override auto-parallelism
 punter features --cutoff-minutes 10
 punter train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
-punter backtest --cutoff-minutes 10 --split-date 2023-01-01
+punter backtest --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints top bets; use --no-show-bets
 punter score --cutoff-minutes 10 --dry-run
 punter status
 punter report
@@ -114,7 +114,7 @@ Or individual steps:
 python punter.py ingest --archive data/data.tar
 python punter.py features --cutoff-minutes 10
 python punter.py train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
-python punter.py backtest --cutoff-minutes 10 --split-date 2023-01-01
+python punter.py backtest --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints top bets; use --no-show-bets
 python punter.py score --cutoff-minutes 10 --dry-run
 python punter.py status  # show table row counts
 

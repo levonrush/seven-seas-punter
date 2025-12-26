@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS markets (
     venue TEXT,
     race_start_time TIMESTAMP,
     race_name TEXT,
+    market_type TEXT,
     country_code TEXT,
     event_type TEXT
 );
@@ -61,3 +62,5 @@ CREATE TABLE IF NOT EXISTS model_runs (
     notes TEXT,
     metrics JSON
 );
+
+ALTER TABLE markets ADD COLUMN IF NOT EXISTS market_type TEXT;

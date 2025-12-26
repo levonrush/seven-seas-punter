@@ -3,7 +3,7 @@ import datetime as dt
 import json
 import pathlib
 
-from shared.backtest.engine import run_backtest
+from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
@@ -126,6 +126,15 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     )
     store.record_bets(bets.to_dict(orient="records"))
     log(f"Backtest metrics: {metrics}")
+    if getattr(args, "show_bets", True):
+        preview = build_bet_preview(
+            bets, runners=store.load_runners(), markets=store.load_markets(), limit=args.bets_limit
+        )
+        if preview.empty:
+            log("Bet preview: no bets to show.")
+        else:
+            log(f"Bet preview: top {len(preview)} bets by expected value.")
+            print(preview.to_string(index=False))
 
 
 def cmd_score(args: argparse.Namespace) -> None:
@@ -352,6 +361,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-date",
         help="ISO date/time; backtest uses races on/after this (holdout set).",
     )
+    p_bt.add_argument(
+        "--show-bets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a preview of top bets after backtest.",
+    )
+    p_bt.add_argument("--bets-limit", type=int, default=20, help="Rows to show in bet preview.")
     p_bt.set_defaults(func=cmd_backtest)
 
     p_score = sub.add_parser("score", help="Score today and output CSV")
@@ -377,6 +393,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-date",
         help="ISO date/time; train uses races before this, backtest uses on/after.",
     )
+    p_pipe.add_argument(
+        "--show-bets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a preview of top bets after backtest.",
+    )
+    p_pipe.add_argument("--bets-limit", type=int, default=20, help="Rows to show in bet preview.")
     p_pipe.add_argument(
         "--report",
         action=argparse.BooleanOptionalAction,
@@ -412,6 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
                 skip_train=False,
                 skip_backtest=False,
                 skip_score=False,
+                show_bets=True,
+                bets_limit=20,
                 report=True,
             )
         )

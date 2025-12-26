@@ -1,6 +1,6 @@
 import argparse
 
-from shared.backtest.engine import run_backtest
+from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.training import load_model_and_calibrator, predict_probabilities
 from shared.storage.duckdb_store import DuckDBStore
@@ -21,6 +21,13 @@ def main() -> None:
         "--split-date",
         help="ISO date/time; backtest uses races on/after this (holdout set).",
     )
+    parser.add_argument(
+        "--show-bets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a preview of top bets after backtest.",
+    )
+    parser.add_argument("--bets-limit", type=int, default=20, help="Rows to show in bet preview.")
     args = parser.parse_args()
 
     log(f"Backtest: cutoff T-{args.cutoff_minutes}")
@@ -61,6 +68,15 @@ def main() -> None:
     store.record_bets(
         bet_df.to_dict(orient="records") if hasattr(bet_df, "to_dict") else [],
     )
+    if args.show_bets:
+        preview = build_bet_preview(
+            bet_df, runners=store.load_runners(), markets=store.load_markets(), limit=args.bets_limit
+        )
+        if preview.empty:
+            log("Bet preview: no bets to show.")
+        else:
+            log(f"Bet preview: top {len(preview)} bets by expected value.")
+            print(preview.to_string(index=False))
 
 
 if __name__ == "__main__":

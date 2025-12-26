@@ -55,7 +55,15 @@ class DuckDBStore:
         df = pd.DataFrame(list(markets))
         if df.empty:
             return
-        cols = ["market_id", "venue", "race_start_time", "race_name", "country_code", "event_type"]
+        cols = [
+            "market_id",
+            "venue",
+            "race_start_time",
+            "race_name",
+            "market_type",
+            "country_code",
+            "event_type",
+        ]
         for col in cols:
             if col not in df.columns:
                 df[col] = None
@@ -66,11 +74,12 @@ class DuckDBStore:
             con.execute(
                 """
                 INSERT INTO markets AS m
-                SELECT market_id, venue, race_start_time, race_name, country_code, event_type FROM df
+                SELECT market_id, venue, race_start_time, race_name, market_type, country_code, event_type FROM df
                 ON CONFLICT (market_id) DO UPDATE
                 SET venue=excluded.venue,
                     race_start_time=excluded.race_start_time,
                     race_name=excluded.race_name,
+                    market_type=excluded.market_type,
                     country_code=excluded.country_code,
                     event_type=excluded.event_type
                 """
@@ -238,6 +247,11 @@ class DuckDBStore:
         """Return stored markets for reporting and joins."""
         with self._connect() as con:
             return con.execute("SELECT * FROM markets").df()
+
+    def load_runners(self) -> pd.DataFrame:
+        """Return stored runners for reporting and joins."""
+        with self._connect() as con:
+            return con.execute("SELECT * FROM runners").df()
 
     def load_runners(self) -> pd.DataFrame:
         """Return stored runners for joins."""

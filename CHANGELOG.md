@@ -22,3 +22,5 @@ All notable changes to this project will be documented in this file.
 - Switched calibration to explicit holdout isotonic/Platt scaling with group-aware splits to reduce market leakage.
 - Fixed test fixtures for expected value math and optional results handling.
 - Added auto-report output after training/pipeline, with `--no-report` to suppress.
+- Added automatic bet preview output after backtests, with `--no-show-bets` to suppress.
+- Added market_type to market metadata and bet previews for exotic bet visibility.

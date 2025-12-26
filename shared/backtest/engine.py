@@ -137,3 +137,52 @@ def run_backtest(
         f"Backtest: candidates={len(df)}, bets={len(bet_df)}, roi={metrics['roi']:.4f}, expected_roi={metrics['expected_roi']:.4f}"
     )
     return bet_df, metrics
+
+
+def build_bet_preview(
+    bet_df: pd.DataFrame,
+    runners: pd.DataFrame | None = None,
+    markets: pd.DataFrame | None = None,
+    limit: int = 20,
+) -> pd.DataFrame:
+    """Return a concise bet preview table for sanity checking model selections."""
+    if bet_df.empty or "expected_value" not in bet_df.columns:
+        return pd.DataFrame()
+
+    preview = bet_df.copy()
+    if runners is not None and not runners.empty:
+        preview = preview.merge(
+            runners[["market_id", "selection_id", "runner_name"]],
+            on=["market_id", "selection_id"],
+            how="left",
+        )
+    if markets is not None and not markets.empty:
+        preview = preview.merge(
+            markets[["market_id", "venue", "race_start_time"]],
+            on="market_id",
+            how="left",
+            suffixes=("", "_market"),
+        )
+        if "race_start_time_market" in preview.columns:
+            preview["race_start_time"] = preview["race_start_time"].fillna(preview["race_start_time_market"])
+            preview = preview.drop(columns=["race_start_time_market"])
+
+    if "runner_name" not in preview.columns:
+        preview["runner_name"] = None
+    preview["selection"] = preview["runner_name"].fillna(preview["selection_id"].astype(str))
+
+    preview = preview.sort_values("expected_value", ascending=False).head(limit)
+    columns = [
+        "race_start_time",
+        "venue",
+        "market_type",
+        "selection",
+        "price",
+        "expected_value",
+        "stake",
+        "bet_type",
+        "result_profit",
+        "market_id",
+    ]
+    columns = [col for col in columns if col in preview.columns]
+    return preview[columns]

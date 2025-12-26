@@ -71,6 +71,7 @@ def _market_definition_to_rows(
         "venue": md.get("venue") or md.get("eventName"),
         "race_start_time": market_time,
         "race_name": md.get("name"),
+        "market_type": md.get("marketType"),
         "country_code": md.get("countryCode"),
         "event_type": md.get("eventTypeId"),
     }
