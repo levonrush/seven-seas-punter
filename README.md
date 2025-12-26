@@ -2,7 +2,7 @@
 
 ![Seven Seas Punter logo](images/seven-seas-logo.png)
 
-Welcome to the Punters Club at the Seven Seas Hotel — where we turn pre‑jump markets into pre‑pub tall tales. The plan: scoop Betfair data, bottle it into features, train a model that can spot value, and then roll up with a cheeky shortlist of bets that *might* just pay for the next round. And yes, the entire project is vibe coded.
+Welcome to the Punters Club at the Seven Seas Hotel — where we turn pre‑jump markets into pre‑pub tall tales. The plan: scoop Betfair data, bottle it into features, train a model that can spot value, and then roll up with a cheeky shortlist of bets that *might* just pay for the next round. And yes, the entire project is vibe coded, plus a healthy dose of “blind coding” when the dev team is at the Sevens and absolutely blind.
 
 Pipeline for Betfair Exchange AU horse racing: download markets, snapshot odds, build leakage-safe features, train calibrated models, backtest value strategies, and score daily opportunities.
 

@@ -10,3 +10,5 @@ All notable changes to this project will be documented in this file.
 - Added logo asset and playful Punters Club intro to README.
 - Improved elapsed-time logs to show seconds/minutes/hours as needed.
 - Added ingest short-circuit when snapshots already exist, with `--force-ingest` to override.
+- Added CSV fallback when parquet engine is missing during feature export.
+- Added “blind coding” banter to README.
