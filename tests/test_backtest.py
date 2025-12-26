@@ -5,8 +5,8 @@ from shared.backtest.engine import compute_expected_value, run_backtest
 
 def test_expected_value_computation():
     ev = compute_expected_value(prob=0.25, price=5.0, commission=0.05)
-    # Expected profit: 0.25 * 4 * 0.95 - 0.75 = -0.05
-    assert round(ev, 4) == -0.05
+    # Expected profit: 0.25 * 4 * 0.95 - 0.75 = 0.20
+    assert round(ev, 4) == 0.2
 
 
 def test_backtest_metrics():

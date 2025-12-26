@@ -1,7 +1,7 @@
 import argparse
 
 from shared.backtest.engine import run_backtest
-from shared.features.builder import build_features_from_store
+from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.training import load_model_and_calibrator, predict_probabilities
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.progress import log
@@ -17,11 +17,23 @@ def main() -> None:
     parser.add_argument("--stake", type=float, default=1.0)
     parser.add_argument("--model-path", type=str, default=None, help="Optional explicit model path.")
     parser.add_argument("--calibrator-path", type=str, default=None, help="Optional calibrator path.")
+    parser.add_argument(
+        "--split-date",
+        help="ISO date/time; backtest uses races on/after this (holdout set).",
+    )
     args = parser.parse_args()
 
     log(f"Backtest: cutoff T-{args.cutoff_minutes}")
     store = DuckDBStore()
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    if args.split_date:
+        _, features = split_features_by_race_time(features, args.split_date)
+        log(f"Backtest: split-date {args.split_date} -> {len(features)} rows.")
+    else:
+        log("Backtest: no split-date set; backtest is in-sample.")
+    if features.empty:
+        log("Backtest: no features available after split; skipping.")
+        return
     model_path = args.model_path or f"artifacts/model_cutoff_{args.cutoff_minutes}.joblib"
     calibrator_path = args.calibrator_path or f"artifacts/calibrator_cutoff_{args.cutoff_minutes}.joblib"
 

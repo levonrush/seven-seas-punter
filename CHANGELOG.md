@@ -13,3 +13,11 @@ All notable changes to this project will be documented in this file.
 - Added CSV fallback when parquet engine is missing during feature export.
 - Added CSV fallback for CLI feature export when parquet engine is missing.
 - Added “blind coding” banter to README.
+- Made model calibration compatible with scikit-learn versions that expect `estimator` instead of `base_estimator`.
+- Quieted LightGBM training output by default.
+- Adjusted calibration fallback to avoid `cv='prefit'` in newer scikit-learn versions.
+- Added expected profit/ROI tracking in backtests and a `punter report` summary command.
+- Enforced strict cutoff offsets in feature building to prevent using post-cutoff signals.
+- Added split-date support for train/backtest/pipeline commands to keep evaluations out-of-sample.
+- Switched calibration to explicit holdout isotonic/Platt scaling with group-aware splits to reduce market leakage.
+- Fixed test fixtures for expected value math and optional results handling.

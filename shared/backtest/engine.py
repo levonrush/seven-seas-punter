@@ -88,6 +88,7 @@ def run_backtest(
     bet_df["bet_time"] = pd.to_datetime(bet_df["race_start_time"]) - pd.to_timedelta(cutoff_minutes, unit="m")
     bet_df["bet_type"] = "BACK"
     bet_df["commission_rate"] = commission
+    bet_df["expected_profit"] = bet_df["expected_value"] * bet_df["stake"]
     stake_sum = bet_df["stake"].sum()
     bet_df["profit"] = bet_df.apply(
         lambda r: r["stake"] * (r["price"] - 1) * (1 - commission) if r.get("win_flag") else -r["stake"],
@@ -95,9 +96,11 @@ def run_backtest(
     )
     bet_df["result_profit"] = bet_df["profit"]
     profit = bet_df["profit"].sum()
+    expected_profit = bet_df["expected_profit"].sum()
     wins = (bet_df["win_flag"] == 1).sum() if "win_flag" in bet_df else 0
     hit_rate = wins / len(bet_df) if len(bet_df) else 0
     roi = profit / stake_sum if stake_sum else 0
+    expected_roi = expected_profit / stake_sum if stake_sum else 0
 
     # Drawdown
     bet_df = bet_df.sort_values(["race_start_time", "market_id", "selection_id"])
@@ -121,12 +124,16 @@ def run_backtest(
     metrics = {
         "bets": len(bet_df),
         "profit": float(profit),
+        "expected_profit": float(expected_profit),
         "turnover": float(stake_sum),
         "roi": float(roi),
+        "expected_roi": float(expected_roi),
         "hit_rate": float(hit_rate),
         "max_drawdown": float(max_drawdown),
         "avg_price_improvement": float(price_improvement) if price_improvement is not None else None,
     }
 
-    log(f"Backtest: candidates={len(df)}, bets={len(bet_df)}, roi={metrics['roi']:.4f}")
+    log(
+        f"Backtest: candidates={len(df)}, bets={len(bet_df)}, roi={metrics['roi']:.4f}, expected_roi={metrics['expected_roi']:.4f}"
+    )
     return bet_df, metrics

@@ -54,11 +54,11 @@ Each step is runnable independently; all commands assume the repo root with your
   ```
 - Train + calibrate baseline:
   ```bash
-  python workflow/train_model.py --cutoff-minutes 10
+  python workflow/train_model.py --cutoff-minutes 10 --split-date 2023-01-01
   ```
 - Backtest value strategy:
   ```bash
-  python workflow/backtest.py --cutoff-minutes 10
+  python workflow/backtest.py --cutoff-minutes 10 --split-date 2023-01-01
   ```
 - Score today:
   ```bash
@@ -80,16 +80,17 @@ pytest
 One wrapper to run individual steps or a full pipeline:
 ```bash
 # Ingest stream tar, build features, train, backtest, and score (dry-run scoring by default)
-punter pipeline --archive data/data.tar --cutoff-minutes 10 --dry-run
+punter pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run
 
 # Or run individual subcommands:
 punter ingest --archive data/data.tar
 punter ingest --archive data/data.tar --workers 6  # override auto-parallelism
 punter features --cutoff-minutes 10
-punter train --cutoff-minutes 10
-punter backtest --cutoff-minutes 10
+punter train --cutoff-minutes 10 --split-date 2023-01-01
+punter backtest --cutoff-minutes 10 --split-date 2023-01-01
 punter score --cutoff-minutes 10 --dry-run
 punter status
+punter report
 punter quickstart --cutoff-minutes 10
 ```
 If you haven't installed the editable package, you can still run:
@@ -100,6 +101,7 @@ python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --dry-run
 ## Notes
 - Betfair integration uses `betfairlightweight`. Missing credentials automatically enable dry-run mock data.
 - Model training uses LightGBM tuned with Optuna (Bayesian search) when available; it falls back to scikit-learn HistGradientBoosting if LightGBM/Optuna are missing.
+- Use `--split-date` to keep training and backtests leakage-safe (train on races before the date, test on races after).
 - All functions use snake_case and include docstrings describing purpose + behavior.
 - Models are saved in `artifacts/` and tracked in DuckDB `model_runs`.
 ## Unified CLI (`punter`)
@@ -111,8 +113,8 @@ Or individual steps:
 ```bash
 python punter.py ingest --archive data/data.tar
 python punter.py features --cutoff-minutes 10
-python punter.py train --cutoff-minutes 10
-python punter.py backtest --cutoff-minutes 10
+python punter.py train --cutoff-minutes 10 --split-date 2023-01-01
+python punter.py backtest --cutoff-minutes 10 --split-date 2023-01-01
 python punter.py score --cutoff-minutes 10 --dry-run
 python punter.py status  # show table row counts
 

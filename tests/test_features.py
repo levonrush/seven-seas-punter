@@ -1,6 +1,6 @@
 import pandas as pd
 
-from shared.features.builder import build_features_from_store
+from shared.features.builder import build_features_from_store, split_features_by_race_time
 
 
 class FakeStore:
@@ -8,7 +8,7 @@ class FakeStore:
 
     def __init__(self, snapshots: pd.DataFrame, results: pd.DataFrame | None = None):
         self._snapshots = snapshots
-        self._results = results or pd.DataFrame()
+        self._results = results if results is not None else pd.DataFrame()
 
     def load_snapshots(self) -> pd.DataFrame:
         return self._snapshots
@@ -85,3 +85,16 @@ def test_feature_builder_uses_cutoff_and_sets_ranks():
     rank_runner2 = features.loc[features["selection_id"] == 2, "rank_t10"].iloc[0]
     assert rank_runner1 < rank_runner2  # better odds -> higher prob -> lower rank number
     assert features["win_target"].isnull().sum() == 0
+    assert pd.isna(features.loc[features["selection_id"] == 1, "back_price_t2"].iloc[0])
+
+
+def test_split_features_by_race_time():
+    features = pd.DataFrame(
+        [
+            {"market_id": "1.1", "selection_id": 1, "race_start_time": "2024-01-01T00:10:00Z"},
+            {"market_id": "1.2", "selection_id": 2, "race_start_time": "2024-01-02T00:10:00Z"},
+        ]
+    )
+    train_df, test_df = split_features_by_race_time(features, "2024-01-02")
+    assert len(train_df) == 1
+    assert len(test_df) == 1

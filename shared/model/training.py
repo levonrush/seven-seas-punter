@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import joblib
+import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from shared.utils.progress import log
 
@@ -22,6 +24,24 @@ try:
     import optuna
 except ImportError:  # pragma: no cover - optional dependency
     optuna = None
+
+
+class ProbabilityCalibrator:
+    """Calibrate raw model probabilities using isotonic or Platt scaling."""
+
+    def __init__(self, method: str, calibrator) -> None:
+        """Store the calibration method and fitted calibrator."""
+        self.method = method
+        self.calibrator = calibrator
+
+    def calibrate(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Transform raw probabilities into calibrated probabilities."""
+        raw = np.asarray(raw_probs, dtype=float).reshape(-1)
+        if self.method == "isotonic":
+            return self.calibrator.predict(raw)
+        if self.method == "platt":
+            return self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+        raise ValueError(f"Unknown calibration method: {self.method}")
 
 
 def _feature_columns(df: pd.DataFrame) -> list[str]:
@@ -39,7 +59,7 @@ def _feature_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _bayes_optimize_lightgbm(
-    X: pd.DataFrame, y: pd.Series, n_trials: int = 20
+    X: pd.DataFrame, y: pd.Series, groups: Optional[pd.Series] = None, n_trials: int = 20
 ) -> tuple[Optional[dict], Optional[float]]:
     """Run a small Bayesian hyperparameter search for LightGBM; returns best params and score."""
     if lgb is None or optuna is None:
@@ -47,8 +67,8 @@ def _bayes_optimize_lightgbm(
         return None, None
 
     log(f"Training: Optuna tuning with {n_trials} trials.")
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    X_train, X_valid, y_train, y_valid, _ = _split_train_calib(
+        X, y, groups=groups, test_size=0.2, random_state=42, label="Optuna"
     )
 
     def objective(trial: "optuna.Trial") -> float:
@@ -63,6 +83,7 @@ def _bayes_optimize_lightgbm(
             "min_child_samples": trial.suggest_int("min_child_samples", 10, 120),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
+            "verbosity": -1,
         }
         model = lgb.LGBMClassifier(
             random_state=42,
@@ -85,8 +106,59 @@ def _bayes_optimize_lightgbm(
     # Ensure deterministic training
     best_params["objective"] = "binary"
     best_params["random_state"] = 42
+    best_params["verbosity"] = -1
     log(f"Training: best Optuna score={best_score:.5f}")
     return best_params, best_score
+
+
+def _split_train_calib(
+    X: pd.DataFrame,
+    y: pd.Series,
+    groups: Optional[pd.Series],
+    test_size: float,
+    random_state: int,
+    label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Optional[pd.Series]]:
+    """Split data into train/calib sets while avoiding market leakage when possible."""
+    if groups is None or groups.nunique() < 2:
+        log(f"{label}: group split unavailable; using stratified random split.")
+        X_train, X_calib, y_train, y_calib = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+        return X_train, X_calib, y_train, y_calib, None
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_idx, calib_idx = next(splitter.split(X, y, groups))
+    y_train = y.iloc[train_idx]
+    y_calib = y.iloc[calib_idx]
+    if y_train.nunique() < 2 or y_calib.nunique() < 2:
+        log(f"{label}: group split produced single-class set; using stratified random split.")
+        X_train, X_calib, y_train, y_calib = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+        return X_train, X_calib, y_train, y_calib, None
+
+    X_train = X.iloc[train_idx]
+    X_calib = X.iloc[calib_idx]
+    groups_train = groups.iloc[train_idx]
+    return X_train, X_calib, y_train, y_calib, groups_train
+
+
+def _fit_probability_calibrator(
+    raw_probs: np.ndarray, y: pd.Series
+) -> tuple[ProbabilityCalibrator, np.ndarray]:
+    """Fit a calibrator on raw probabilities and return calibrated predictions."""
+    try:
+        isotonic = IsotonicRegression(out_of_bounds="clip")
+        isotonic.fit(raw_probs, y)
+        calibrated = isotonic.predict(raw_probs)
+        return ProbabilityCalibrator("isotonic", isotonic), calibrated
+    except Exception as exc:  # pragma: no cover - rare fallback
+        log(f"Training: isotonic calibration failed ({exc}); falling back to Platt scaling.")
+        platt = LogisticRegression(max_iter=200, solver="lbfgs")
+        platt.fit(raw_probs.reshape(-1, 1), y)
+        calibrated = platt.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+        return ProbabilityCalibrator("platt", platt), calibrated
 
 
 def train_and_calibrate(
@@ -94,6 +166,7 @@ def train_and_calibrate(
     cutoff_minutes: int,
     artifacts_dir: str = "artifacts",
     store=None,
+    split_date: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Dict[str, float]]:
     """Train a tuned LightGBM model (Bayesian search) when available, with calibrated probabilities."""
     df = features_df.dropna(subset=["win_target"])
@@ -103,12 +176,15 @@ def train_and_calibrate(
 
     X = df[_feature_columns(df)].fillna(0.0)
     y = df["win_target"].astype(int)
+    groups = df["market_id"] if "market_id" in df.columns else None
     log(f"Training: {len(df)} rows, {X.shape[1]} features, cutoff T-{cutoff_minutes}.")
-    X_train, X_calib, y_train, y_calib = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    X_train, X_calib, y_train, y_calib, groups_train = _split_train_calib(
+        X, y, groups=groups, test_size=0.2, random_state=42, label="Training"
     )
 
-    best_params, tuning_score = _bayes_optimize_lightgbm(X_train, y_train, n_trials=25)
+    best_params, tuning_score = _bayes_optimize_lightgbm(
+        X_train, y_train, groups=groups_train, n_trials=25
+    )
     if best_params and lgb is not None:
         base_model = lgb.LGBMClassifier(**best_params)
         base_model.fit(X_train, y_train)
@@ -120,20 +196,31 @@ def train_and_calibrate(
         model_label = "HistGradientBoosting fallback"
         log("Training: using HistGradientBoosting fallback.")
 
-    calibrator = CalibratedClassifierCV(base_estimator=base_model, method="isotonic", cv="prefit")
-    calibrator.fit(X_calib, y_calib)
+    calibrator = None
+    if len(X_calib):
+        raw_calib = base_model.predict_proba(X_calib)[:, 1]
+        calibrator, probs = _fit_probability_calibrator(raw_calib, y_calib)
+        eval_y = y_calib
+    else:
+        log("Training: no calibration rows available; skipping calibration.")
+        probs = base_model.predict_proba(X_train)[:, 1]
+        eval_y = y_train
 
-    probs = calibrator.predict_proba(X_calib)[:, 1]
     best_params_clean = {
         k: (float(v) if isinstance(v, (int, float)) else v) for k, v in (best_params or {}).items()
     }
     metrics = {
-        "log_loss": float(log_loss(y_calib, probs)),
-        "brier": float(brier_score_loss(y_calib, probs)),
+        "log_loss": float(log_loss(eval_y, probs)),
+        "brier": float(brier_score_loss(eval_y, probs)),
         "cutoff_minutes": float(cutoff_minutes),
         "tuning_score": float(tuning_score) if tuning_score is not None else None,
         "model_label": model_label,
         "best_params": best_params_clean,
+        "calibration_method": calibrator.method if isinstance(calibrator, ProbabilityCalibrator) else None,
+        "train_rows": int(len(X_train)),
+        "calib_rows": int(len(X_calib)),
+        "train_markets": int(groups_train.nunique()) if groups_train is not None else None,
+        "split_date": split_date,
     }
 
     artifacts_path = Path(os.getenv("ARTIFACTS_DIR", artifacts_dir))
@@ -169,6 +256,15 @@ def predict_probabilities(model, calibrator, feature_df: pd.DataFrame) -> pd.Ser
     if feature_df.empty:
         return pd.Series(dtype=float)
     X = feature_df[_feature_columns(feature_df)].fillna(0.0)
-    if calibrator:
+    raw_probs = model.predict_proba(X)[:, 1]
+    if calibrator is None:
+        return pd.Series(raw_probs, index=feature_df.index)
+    if isinstance(calibrator, ProbabilityCalibrator):
+        calibrated = calibrator.calibrate(raw_probs)
+        return pd.Series(calibrated, index=feature_df.index)
+    if hasattr(calibrator, "predict_proba"):
         return pd.Series(calibrator.predict_proba(X)[:, 1], index=feature_df.index)
-    return pd.Series(model.predict_proba(X)[:, 1], index=feature_df.index)
+    if hasattr(calibrator, "predict"):
+        calibrated = calibrator.predict(raw_probs)
+        return pd.Series(calibrated, index=feature_df.index)
+    return pd.Series(raw_probs, index=feature_df.index)

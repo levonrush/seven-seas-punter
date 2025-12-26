@@ -1,10 +1,11 @@
 import argparse
 import datetime as dt
+import json
 import pathlib
 
 from shared.backtest.engine import run_backtest
 from shared.betfair.client import BetfairClient
-from shared.features.builder import build_features_from_store
+from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.progress import log
@@ -73,8 +74,19 @@ def cmd_train(args: argparse.Namespace) -> None:
     print(f"Training model (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    if getattr(args, "split_date", None):
+        features, _ = split_features_by_race_time(features, args.split_date)
+        log(f"Training: split-date {args.split_date} -> {len(features)} rows.")
+    else:
+        log("Training: no split-date set; training on full dataset (in-sample).")
+    if features.empty:
+        log("Training: no features available after split; skipping.")
+        return
     model_path, calibrator_path, metrics = train_and_calibrate(
-        features_df=features, cutoff_minutes=args.cutoff_minutes, store=store
+        features_df=features,
+        cutoff_minutes=args.cutoff_minutes,
+        store=store,
+        split_date=getattr(args, "split_date", None),
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
 
@@ -84,6 +96,14 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     print(f"Backtesting (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    if getattr(args, "split_date", None):
+        _, features = split_features_by_race_time(features, args.split_date)
+        log(f"Backtest: split-date {args.split_date} -> {len(features)} rows.")
+    else:
+        log("Backtest: no split-date set; backtest is in-sample.")
+    if features.empty:
+        log("Backtest: no features available after split; skipping.")
+        return
     model_path = getattr(args, "model_path", None) or f"artifacts/model_cutoff_{args.cutoff_minutes}.joblib"
     calibrator_path = getattr(args, "calibrator_path", None) or f"artifacts/calibrator_cutoff_{args.cutoff_minutes}.joblib"
     try:
@@ -200,6 +220,57 @@ def cmd_status(args: argparse.Namespace) -> None:
     log(f"DB counts: {counts}")
 
 
+def cmd_report(args: argparse.Namespace) -> None:
+    """Print latest model metrics and backtest profit summary."""
+    store = DuckDBStore()
+    with store._connect() as con:  # type: ignore[attr-defined]
+        model_row = con.execute(
+            """
+            SELECT created_at, cutoff_minutes, model_path, calibrator_path, metrics
+            FROM model_runs
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        bet_row = con.execute(
+            """
+            SELECT
+                COUNT(*) AS bets,
+                SUM(stake) AS turnover,
+                SUM(result_profit) AS profit,
+                SUM(expected_value * stake) AS expected_profit,
+                SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
+            FROM bets
+            """
+        ).fetchone()
+
+    if model_row:
+        created_at, cutoff_minutes, model_path, calibrator_path, metrics = model_row
+        if isinstance(metrics, str):
+            try:
+                metrics = json.loads(metrics)
+            except json.JSONDecodeError:
+                metrics = {"raw": metrics}
+        log(f"Latest model run: {created_at} cutoff=T-{cutoff_minutes}")
+        log(f"Model path: {model_path}")
+        log(f"Calibrator path: {calibrator_path}")
+        log(f"Model metrics: {metrics}")
+    else:
+        log("No model_runs found.")
+
+    if bet_row and bet_row[0]:
+        bets, turnover, profit, expected_profit, hit_rate = bet_row
+        roi = (profit / turnover) if turnover else 0
+        expected_roi = (expected_profit / turnover) if turnover else 0
+        log(
+            f"Backtest summary: bets={bets}, turnover={turnover:.2f}, profit={profit:.2f}, "
+            f"roi={roi:.4f}, expected_profit={expected_profit:.2f}, expected_roi={expected_roi:.4f}, "
+            f"hit_rate={hit_rate:.3f}"
+        )
+    else:
+        log("No bets found.")
+
+
 def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
     log("Starting pipeline...")
@@ -252,6 +323,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_train = sub.add_parser("train", help="Train model at cutoff")
     p_train.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
+    p_train.add_argument(
+        "--split-date",
+        help="ISO date/time; training uses races strictly before this (leakage-safe split).",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_bt = sub.add_parser("backtest", help="Backtest value strategy")
@@ -262,6 +337,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--stake", type=float, default=1.0)
     p_bt.add_argument("--model-path")
     p_bt.add_argument("--calibrator-path")
+    p_bt.add_argument(
+        "--split-date",
+        help="ISO date/time; backtest uses races on/after this (holdout set).",
+    )
     p_bt.set_defaults(func=cmd_backtest)
 
     p_score = sub.add_parser("score", help="Score today and output CSV")
@@ -283,6 +362,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
     p_pipe.add_argument("--max-spread", type=float, default=1.0)
     p_pipe.add_argument("--stake", type=float, default=1.0)
+    p_pipe.add_argument(
+        "--split-date",
+        help="ISO date/time; train uses races before this, backtest uses on/after.",
+    )
     p_pipe.add_argument("--output")
     p_pipe.add_argument("--dry-run", action="store_true", help="Applied to scoring step")
     p_pipe.add_argument("--skip-features", action="store_true")
@@ -318,6 +401,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show row counts in DuckDB tables")
     p_status.set_defaults(func=cmd_status)
+
+    p_report = sub.add_parser("report", help="Show latest model metrics and backtest summary")
+    p_report.set_defaults(func=cmd_report)
 
     return parser
 
