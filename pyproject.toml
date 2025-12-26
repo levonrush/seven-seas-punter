@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "seven-seas-punter"
+version = "0.1.0"
+description = "Betfair Exchange AU horse racing pipeline: data download, features, modeling, backtesting, and daily scoring."
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "shared" }, { include = "workflow" }]
+
+[tool.poetry.scripts]
+punter = "workflow.cli:main"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+pandas = "^2.2.0"
+numpy = "^1.26.0"
+duckdb = "^0.10.0"
+betfairlightweight = "^2.14.0"
+scikit-learn = "^1.4.0"
+python-dotenv = "^1.0.1"
+joblib = "^1.3.2"
+lightgbm = "^4.3.0"
+optuna = "^3.6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.1.0"
+black = "^24.3.0"
+isort = "^5.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100

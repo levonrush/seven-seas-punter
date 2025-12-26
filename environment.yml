@@ -1,0 +1,20 @@
+name: punter
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pandas
+  - numpy
+  - duckdb
+  - scikit-learn
+  - joblib
+  - python-dotenv
+  - lightgbm
+  - optuna
+  - pytest
+  - black
+  - isort
+  - pip
+  - pip:
+      - betfairlightweight
+      - -e .
