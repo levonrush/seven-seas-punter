@@ -13,7 +13,10 @@ def main() -> None:
     parser.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     parser.add_argument("--commission", type=float, default=0.05)
     parser.add_argument("--min-ev", type=float, default=0.02)
+    parser.add_argument("--min-edge", type=float, default=0.1)
     parser.add_argument("--max-spread", type=float, default=1.0)
+    parser.add_argument("--max-price", type=float, default=200.0)
+    parser.add_argument("--max-edge-mult", type=float, default=5.0)
     parser.add_argument("--stake", type=float, default=1.0)
     parser.add_argument("--model-path", type=str, default=None, help="Optional explicit model path.")
     parser.add_argument("--calibrator-path", type=str, default=None, help="Optional calibrator path.")
@@ -59,7 +62,10 @@ def main() -> None:
         cutoff_minutes=args.cutoff_minutes,
         commission=args.commission,
         min_ev=args.min_ev,
+        min_edge=args.min_edge,
         max_spread=args.max_spread,
+        max_price=args.max_price,
+        max_edge_multiplier=args.max_edge_mult,
         stake=args.stake,
     )
     log(f"Backtest metrics: {metrics}")

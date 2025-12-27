@@ -80,13 +80,13 @@ pytest
 One wrapper to run individual steps or a full pipeline:
 ```bash
 # Ingest stream tar, build features, train, backtest, and score (dry-run scoring by default)
-punter pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report; use --no-report
+punter pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report + predictions; use --no-report/--no-show-preds
 
 # Or run individual subcommands:
 punter ingest --archive data/data.tar
 punter ingest --archive data/data.tar --workers 6  # override auto-parallelism
 punter features --cutoff-minutes 10
-punter train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
+punter train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report + predictions; use --no-report/--no-show-preds
 punter backtest --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints top bets; use --no-show-bets
 punter score --cutoff-minutes 10 --dry-run
 punter status
@@ -95,13 +95,16 @@ punter quickstart --cutoff-minutes 10
 ```
 If you haven't installed the editable package, you can still run:
 ```bash
-python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report; use --no-report
+python punter.py pipeline --archive data/data.tar --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # auto-prints report + predictions; use --no-report/--no-show-preds
 ```
 
 ## Notes
 - Betfair integration uses `betfairlightweight`. Missing credentials automatically enable dry-run mock data.
-- Model training uses LightGBM tuned with Optuna (Bayesian search) when available; it falls back to scikit-learn HistGradientBoosting if LightGBM/Optuna are missing.
+- Model training uses LightGBM tuned with Optuna (Bayesian search) when available; it falls back to scikit-learn HistGradientBoosting if LightGBM/Optuna are missing. Tuning uses rolling time-based CV by default.
 - Use `--split-date` to keep training and backtests leakage-safe (train on races before the date, test on races after).
+- Prediction previews after training are based on out-of-fold probabilities from the rolling CV folds.
+- Training metrics are computed from out-of-fold predictions (no holdout required).
+- Preview/backtest filters default to `min_ev=0.02`, `min_edge=0.1`, `max_price=200`, `max_edge_mult=5`. Override with `--preds-*` or `--min-edge/--max-price/--max-edge-mult`.
 - All functions use snake_case and include docstrings describing purpose + behavior.
 - Models are saved in `artifacts/` and tracked in DuckDB `model_runs`.
 ## Unified CLI (`punter`)
@@ -113,7 +116,7 @@ Or individual steps:
 ```bash
 python punter.py ingest --archive data/data.tar
 python punter.py features --cutoff-minutes 10
-python punter.py train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report; use --no-report
+python punter.py train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report + predictions; use --no-report/--no-show-preds
 python punter.py backtest --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints top bets; use --no-show-bets
 python punter.py score --cutoff-minutes 10 --dry-run
 python punter.py status  # show table row counts

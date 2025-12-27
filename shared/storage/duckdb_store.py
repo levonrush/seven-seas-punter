@@ -73,7 +73,15 @@ class DuckDBStore:
             con.register("df", df)
             con.execute(
                 """
-                INSERT INTO markets AS m
+                INSERT INTO markets (
+                    market_id,
+                    venue,
+                    race_start_time,
+                    race_name,
+                    market_type,
+                    country_code,
+                    event_type
+                )
                 SELECT market_id, venue, race_start_time, race_name, market_type, country_code, event_type FROM df
                 ON CONFLICT (market_id) DO UPDATE
                 SET venue=excluded.venue,

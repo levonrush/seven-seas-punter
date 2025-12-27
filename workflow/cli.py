@@ -6,6 +6,7 @@ import pathlib
 from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
+from shared.model.predictions import build_prediction_preview
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.progress import log
@@ -74,21 +75,57 @@ def cmd_train(args: argparse.Namespace) -> None:
     print(f"Training model (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    train_features = features
+    test_features = None
     if getattr(args, "split_date", None):
-        features, _ = split_features_by_race_time(features, args.split_date)
-        log(f"Training: split-date {args.split_date} -> {len(features)} rows.")
+        train_features, test_features = split_features_by_race_time(features, args.split_date)
+        log(f"Training: split-date {args.split_date} -> {len(train_features)} train rows.")
     else:
         log("Training: no split-date set; training on full dataset (in-sample).")
-    if features.empty:
+    if train_features.empty:
         log("Training: no features available after split; skipping.")
         return
-    model_path, calibrator_path, metrics = train_and_calibrate(
-        features_df=features,
+    model_path, calibrator_path, metrics, oof_predictions = train_and_calibrate(
+        features_df=train_features,
         cutoff_minutes=args.cutoff_minutes,
         store=store,
         split_date=getattr(args, "split_date", None),
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
+    if getattr(args, "show_preds", True):
+        if oof_predictions is not None:
+            log("Prediction preview: using out-of-fold predictions from training set.")
+            preview_source = train_features
+            probs = oof_predictions
+        elif test_features is not None:
+            log("Prediction preview: using holdout predictions.")
+            preview_source = test_features
+            model, calibrator = load_model_and_calibrator(model_path, calibrator_path)
+            probs = predict_probabilities(model, calibrator, test_features)
+        else:
+            preview_source = None
+            probs = None
+        if preview_source is not None and not preview_source.empty and probs is not None:
+            preview = build_prediction_preview(
+                preview_source,
+                probs,
+                cutoff_minutes=args.cutoff_minutes,
+                runners=store.load_runners(),
+                markets=store.load_markets(),
+                limit=args.preds_limit,
+                min_ev=args.preds_min_ev,
+                min_edge=args.preds_min_edge,
+                max_price=args.preds_max_price,
+                max_edge_multiplier=args.preds_max_edge_mult,
+                per_market_limit=args.preds_per_market,
+            )
+            if preview.empty:
+                log("Prediction preview: no rows to show.")
+            else:
+                log(f"Prediction preview: top {len(preview)} rows by expected value.")
+                print(preview.to_string(index=False))
+        else:
+            log("Prediction preview: no out-of-fold predictions available.")
     if getattr(args, "report", False):
         cmd_report(args)
 
@@ -121,7 +158,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         cutoff_minutes=args.cutoff_minutes,
         commission=args.commission,
         min_ev=args.min_ev,
+        min_edge=args.min_edge,
         max_spread=args.max_spread,
+        max_price=args.max_price,
+        max_edge_multiplier=args.max_edge_mult,
         stake=args.stake,
     )
     store.record_bets(bets.to_dict(orient="records"))
@@ -342,6 +382,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO date/time; training uses races strictly before this (leakage-safe split).",
     )
     p_train.add_argument(
+        "--show-preds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a preview of top predictions after training.",
+    )
+    p_train.add_argument(
+        "--preds-limit",
+        type=int,
+        default=20,
+        help="Rows to show in the prediction preview.",
+    )
+    p_train.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
+    p_train.add_argument(
+        "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+    )
+    p_train.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
+    p_train.add_argument(
+        "--preds-max-edge-mult",
+        type=float,
+        default=5.0,
+        help="Max multiple of market implied prob to show.",
+    )
+    p_train.add_argument(
+        "--preds-per-market",
+        type=int,
+        default=1,
+        help="Max preview rows per market.",
+    )
+    p_train.add_argument(
         "--report",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -353,7 +422,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_bt.add_argument("--commission", type=float, default=0.05)
     p_bt.add_argument("--min-ev", type=float, default=0.02)
+    p_bt.add_argument("--min-edge", type=float, default=0.1)
     p_bt.add_argument("--max-spread", type=float, default=1.0)
+    p_bt.add_argument("--max-price", type=float, default=200.0)
+    p_bt.add_argument("--max-edge-mult", type=float, default=5.0)
     p_bt.add_argument("--stake", type=float, default=1.0)
     p_bt.add_argument("--model-path")
     p_bt.add_argument("--calibrator-path")
@@ -387,11 +459,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_pipe.add_argument("--commission", type=float, default=0.05)
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
+    p_pipe.add_argument("--min-edge", type=float, default=0.1)
     p_pipe.add_argument("--max-spread", type=float, default=1.0)
+    p_pipe.add_argument("--max-price", type=float, default=200.0)
+    p_pipe.add_argument("--max-edge-mult", type=float, default=5.0)
     p_pipe.add_argument("--stake", type=float, default=1.0)
     p_pipe.add_argument(
         "--split-date",
         help="ISO date/time; train uses races before this, backtest uses on/after.",
+    )
+    p_pipe.add_argument(
+        "--show-preds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print a preview of top predictions after training.",
+    )
+    p_pipe.add_argument(
+        "--preds-limit",
+        type=int,
+        default=20,
+        help="Rows to show in the prediction preview.",
+    )
+    p_pipe.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
+    p_pipe.add_argument(
+        "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+    )
+    p_pipe.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
+    p_pipe.add_argument(
+        "--preds-max-edge-mult",
+        type=float,
+        default=5.0,
+        help="Max multiple of market implied prob to show.",
+    )
+    p_pipe.add_argument(
+        "--preds-per-market",
+        type=int,
+        default=1,
+        help="Max preview rows per market.",
     )
     p_pipe.add_argument(
         "--show-bets",
@@ -427,7 +531,10 @@ def build_parser() -> argparse.ArgumentParser:
                 cutoff_minutes=args.cutoff_minutes,
                 commission=0.05,
                 min_ev=0.02,
+                min_edge=0.1,
                 max_spread=1.0,
+                max_price=200.0,
+                max_edge_mult=5.0,
                 stake=1.0,
                 output=None,
                 dry_run=True,
@@ -435,6 +542,13 @@ def build_parser() -> argparse.ArgumentParser:
                 skip_train=False,
                 skip_backtest=False,
                 skip_score=False,
+                show_preds=True,
+                preds_limit=20,
+                preds_min_ev=0.02,
+                preds_min_edge=0.1,
+                preds_max_price=200.0,
+                preds_max_edge_mult=5.0,
+                preds_per_market=1,
                 show_bets=True,
                 bets_limit=20,
                 report=True,

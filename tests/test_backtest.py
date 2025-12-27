@@ -37,7 +37,10 @@ def test_backtest_metrics():
         cutoff_minutes=10,
         commission=0.05,
         min_ev=-1.0,  # allow both bets
+        min_edge=-1.0,
         max_spread=0.5,
+        max_price=10_000.0,
+        max_edge_multiplier=1_000.0,
         stake=1.0,
     )
     assert metrics["bets"] == 2

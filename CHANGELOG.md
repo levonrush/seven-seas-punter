@@ -24,3 +24,7 @@ All notable changes to this project will be documented in this file.
 - Added auto-report output after training/pipeline, with `--no-report` to suppress.
 - Added automatic bet preview output after backtests, with `--no-show-bets` to suppress.
 - Added market_type to market metadata and bet previews for exotic bet visibility.
+- Added rolling time-based CV for LightGBM tuning (default 5 folds with a 1-day gap).
+- Added out-of-fold prediction previews and calibration driven by rolling CV folds.
+- Added default sanity filters (min edge, max price, edge multiplier) for previews and backtests.
+- Fixed markets upsert column order to populate market_type correctly.
