@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from shared.utils.progress import log
+from shared.utils.bet_explain import annotate_preview_frame
 
 DEFAULT_MIN_EDGE = 0.1
 DEFAULT_MAX_PRICE = 200.0
@@ -39,10 +40,12 @@ def run_backtest(
     stake: float = 1.0,
     max_bets_per_day: int | None = None,
     max_exposure_per_race: float | None = None,
+    quiet: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
     """Simulate a simple value strategy with deterministic filters and risk controls."""
     if feature_df.empty or probs.empty:
-        log("Backtest: empty features or probabilities; skipping.")
+        if not quiet:
+            log("Backtest: empty features or probabilities; skipping.")
         return pd.DataFrame(), {}
 
     df = feature_df.copy()
@@ -93,7 +96,8 @@ def run_backtest(
 
     bet_df = pd.DataFrame(bets)
     if bet_df.empty:
-        log("Backtest: no bets passed filters.")
+        if not quiet:
+            log("Backtest: no bets passed filters.")
         return bet_df, {}
 
     # Apply risk controls
@@ -154,9 +158,11 @@ def run_backtest(
         "avg_price_improvement": float(price_improvement) if price_improvement is not None else None,
     }
 
-    log(
-        f"Backtest: candidates={len(df)}, bets={len(bet_df)}, roi={metrics['roi']:.4f}, expected_roi={metrics['expected_roi']:.4f}"
-    )
+    if not quiet:
+        log(
+            "Backtest: candidates="
+            f"{len(df)}, bets={len(bet_df)}, roi={metrics['roi']:.4f}, expected_roi={metrics['expected_roi']:.4f}"
+        )
     return bet_df, metrics
 
 
@@ -179,7 +185,7 @@ def build_bet_preview(
         )
     if markets is not None and not markets.empty:
         preview = preview.merge(
-            markets[["market_id", "venue", "race_start_time"]],
+            markets[["market_id", "venue", "race_start_time", "market_type"]],
             on="market_id",
             how="left",
             suffixes=("", "_market"),
@@ -192,17 +198,30 @@ def build_bet_preview(
         preview["runner_name"] = None
     preview["selection"] = preview["runner_name"].fillna(preview["selection_id"].astype(str))
 
+    preview = annotate_preview_frame(
+        preview,
+        selection_col="selection",
+        market_type_col="market_type",
+        bet_type_col="bet_type",
+    )
     preview = preview.sort_values("expected_value", ascending=False).head(limit)
     columns = [
         "race_start_time",
         "venue",
         "market_type",
+        "market_type_label",
         "selection",
+        "selection_label",
+        "runner_number",
+        "selection_kind",
+        "selection_notes",
         "price",
         "edge_pct",
         "expected_value",
         "stake",
         "bet_type",
+        "bet_type_label",
+        "bet_guidance",
         "result_profit",
         "market_id",
     ]

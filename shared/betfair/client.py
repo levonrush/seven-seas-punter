@@ -26,6 +26,17 @@ class BetfairClient:
         self.password = password or os.getenv("BETFAIR_PASSWORD")
         self.cert_file = os.getenv("BETFAIR_CERT_FILE")
         self.key_file = os.getenv("BETFAIR_KEY_FILE")
+        if self.cert_file and not os.path.isfile(self.cert_file):
+            logger.warning("BetfairClient: cert file missing, ignoring %s.", self.cert_file)
+            log(f"BetfairClient: cert file missing, ignoring {self.cert_file}.")
+            self.cert_file = None
+        if self.key_file and not os.path.isfile(self.key_file):
+            logger.warning("BetfairClient: key file missing, ignoring %s.", self.key_file)
+            log(f"BetfairClient: key file missing, ignoring {self.key_file}.")
+            self.key_file = None
+        if not (self.cert_file and self.key_file):
+            self.cert_file = None
+            self.key_file = None
         self._dry_run = not all([self.app_key, self.username, self.password, betfairlightweight])
         self._client = None
         if not self._dry_run and betfairlightweight:

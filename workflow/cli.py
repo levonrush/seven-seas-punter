@@ -4,11 +4,13 @@ import json
 import pathlib
 
 from shared.backtest.engine import build_bet_preview, run_backtest
+from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.predictions import build_prediction_preview
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
+from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.progress import log
 from workflow.ingest_archive import ingest_archive_file
 
@@ -16,6 +18,10 @@ from workflow.ingest_archive import ingest_archive_file
 def cmd_ingest(args: argparse.Namespace) -> None:
     """Ingest a tar archive (Betfair stream .bz2 or tabular CSV/Parquet) into DuckDB."""
     store = DuckDBStore()
+    archive_path = pathlib.Path(args.archive)
+    if not archive_path.exists():
+        log(f"Ingest: archive not found at {archive_path}; skipping.")
+        return
     if not args.force_ingest and store.has_data("snapshots"):
         existing = store.table_row_count("snapshots")
         log(
@@ -23,7 +29,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         )
         return
     counts = ingest_archive_file(
-        pathlib.Path(args.archive),
+        archive_path,
         store,
         flush_every=args.flush_every,
         progress_every=args.progress_every,
@@ -52,6 +58,13 @@ def cmd_download(args: argparse.Namespace) -> None:
     results = client.fetch_market_results(market_ids)
     store.upsert_results(results)
     log(f"Downloaded {len(markets)} markets, {len(runner_rows)} runners, {len(snapshots)} snapshots.")
+
+
+def cmd_download_historic(args: argparse.Namespace) -> None:
+    """Download historic data packages using Betfair's historic API."""
+    from workflow.download_historic import run_download_historic
+
+    run_download_historic(args)
 
 
 def cmd_features(args: argparse.Namespace) -> None:
@@ -124,8 +137,53 @@ def cmd_train(args: argparse.Namespace) -> None:
             else:
                 log(f"Prediction preview: top {len(preview)} rows by expected value.")
                 print(preview.to_string(index=False))
+                for line in preview_legend_lines():
+                    log(line)
         else:
             log("Prediction preview: no out-of-fold predictions available.")
+    if getattr(args, "tune_strategy", False):
+        if oof_predictions is None or oof_predictions.empty:
+            log("Strategy tuning: no out-of-fold predictions available; skipping.")
+        else:
+            tuning_features = train_features.loc[oof_predictions.index]
+            commission = getattr(args, "commission", 0.05)
+            results, tradeoff = tune_strategy(
+                feature_df=tuning_features,
+                probs=oof_predictions,
+                cutoff_minutes=args.cutoff_minutes,
+                commission=commission,
+                grid_profile=args.strategy_grid,
+                objective=args.strategy_objective,
+                min_hit_rate=args.strategy_min_hit_rate,
+                min_bets=args.strategy_min_bets,
+                stake=1.0,
+                log_every=args.strategy_log_every,
+            )
+            if results.empty:
+                log("Strategy tuning: no configs met constraints.")
+            else:
+                top_n = min(args.strategy_top_n, len(results))
+                log(f"Strategy tuning: top {top_n} configs by {args.strategy_objective}.")
+                print(results.head(top_n).to_string(index=False))
+                if not tradeoff.empty:
+                    log("Strategy tuning: hit-rate trade-off (best per bucket).")
+                    print(tradeoff.to_string(index=False))
+                output_path = pathlib.Path(
+                    args.strategy_output
+                    or f"artifacts/strategy_tuning_cutoff_{args.cutoff_minutes}.csv"
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                results.to_csv(output_path, index=False)
+                best_path = output_path.with_name(
+                    f"strategy_best_cutoff_{args.cutoff_minutes}.json"
+                )
+                with best_path.open("w", encoding="utf-8") as fh:
+                    best_row = {
+                        key: (value.item() if hasattr(value, "item") else value)
+                        for key, value in results.iloc[0].to_dict().items()
+                    }
+                    json.dump(best_row, fh, indent=2)
+                log(f"Strategy tuning: wrote {output_path} and {best_path}.")
     if getattr(args, "report", False):
         cmd_report(args)
 
@@ -175,6 +233,8 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         else:
             log(f"Bet preview: top {len(preview)} bets by expected value.")
             print(preview.to_string(index=False))
+            for line in preview_legend_lines():
+                log(line)
 
 
 def cmd_score(args: argparse.Namespace) -> None:
@@ -326,6 +386,16 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
     log("Starting pipeline...")
     if args.archive:
+        archive_path = pathlib.Path(args.archive)
+        if not archive_path.exists():
+            log(f"Step: ingest archive skipped (missing {archive_path}).")
+            args.archive = None
+    if not args.archive:
+        default_archive = pathlib.Path("data/data.tar")
+        if default_archive.exists():
+            args.archive = str(default_archive)
+            log(f"Step: ingest archive (default {default_archive}).")
+    if args.archive:
         log("Step: ingest archive")
         cmd_ingest(args)
     elif args.download_date:
@@ -371,6 +441,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--dry-run", action="store_true")
     p_dl.set_defaults(func=cmd_download)
 
+    p_hist = sub.add_parser("download-historic", help="Download historic data via Betfair Historic API")
+    p_hist.add_argument("--auto", action="store_true", help="Download all purchased months for the sport.")
+    p_hist.add_argument("--from-date", help="Start date (YYYY-MM-DD).")
+    p_hist.add_argument("--to-date", help="End date (YYYY-MM-DD).")
+    p_hist.add_argument("--sport", default="Horse Racing", help="Sport name (e.g., Horse Racing).")
+    p_hist.add_argument("--plan", help="Plan name (e.g., Basic Plan). Omit for all plans in --auto.")
+    p_hist.add_argument("--market-types", default="WIN", help="Comma-separated market types.")
+    p_hist.add_argument("--countries", default="AU", help="Comma-separated country codes.")
+    p_hist.add_argument("--file-types", default="M", help="Comma-separated file types (M/E).")
+    p_hist.add_argument("--event-id", type=int)
+    p_hist.add_argument("--event-name")
+    p_hist.add_argument("--show-options", action="store_true", help="Show available filters.")
+    p_hist.add_argument("--size-only", action="store_true", help="Only show file count and size.")
+    p_hist.add_argument("--list-only", action="store_true", help="Only list available files.")
+    p_hist.add_argument("--list-output", help="Optional path to write the file list JSON.")
+    p_hist.add_argument("--download", action="store_true", help="Download the files.")
+    p_hist.add_argument("--output", help="Output tar path (defaults to data/historic_*.tar).")
+    p_hist.add_argument("--output-dir", help="Directory to store downloads before tarring.")
+    p_hist.add_argument("--keep-files", action="store_true", help="Keep downloaded files on disk.")
+    p_hist.add_argument("--clean-temp", action="store_true", help="Remove temp download dir before starting.")
+    p_hist.add_argument("--max-files", type=int, help="Limit number of files (useful for testing).")
+    p_hist.add_argument("--workers", type=int, default=None, help="Parallel download workers.")
+    p_hist.add_argument("--progress-every", type=int, default=50, help="Progress logging frequency.")
+    p_hist.add_argument("--manifest-path", help="Path for download manifest JSON.")
+    p_hist.add_argument("--force", action="store_true", help="Re-download files even if seen before.")
+    p_hist.add_argument("--retries", type=int, default=5, help="Retry count for historic API failures.")
+    p_hist.add_argument("--retry-wait", type=float, default=3.0, help="Seconds to wait between retries.")
+    p_hist.set_defaults(func=cmd_download_historic)
+
     p_feat = sub.add_parser("features", help="Build features at cutoff")
     p_feat.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_feat.set_defaults(func=cmd_features)
@@ -415,6 +514,52 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Print a report summary after training.",
+    )
+    p_train.add_argument(
+        "--tune-strategy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tune betting filters on out-of-fold predictions (use --no-tune-strategy to disable).",
+    )
+    p_train.add_argument(
+        "--strategy-grid",
+        choices=["small", "medium", "large"],
+        default="small",
+        help="Grid size for strategy tuning.",
+    )
+    p_train.add_argument(
+        "--strategy-objective",
+        choices=["expected_roi", "roi", "expected_profit", "profit"],
+        default="expected_roi",
+        help="Metric to maximize during strategy tuning.",
+    )
+    p_train.add_argument(
+        "--strategy-min-hit-rate",
+        type=float,
+        default=0.05,
+        help="Minimum hit rate required for tuned configs.",
+    )
+    p_train.add_argument(
+        "--strategy-min-bets",
+        type=int,
+        default=200,
+        help="Minimum number of bets required for tuned configs.",
+    )
+    p_train.add_argument(
+        "--strategy-top-n",
+        type=int,
+        default=10,
+        help="Top configs to display after tuning.",
+    )
+    p_train.add_argument(
+        "--strategy-log-every",
+        type=int,
+        default=20,
+        help="Progress logging frequency during strategy tuning.",
+    )
+    p_train.add_argument(
+        "--strategy-output",
+        help="Optional CSV path to write strategy tuning results.",
     )
     p_train.set_defaults(func=cmd_train)
 
@@ -510,6 +655,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Print a report summary after the pipeline completes.",
     )
+    p_pipe.add_argument(
+        "--tune-strategy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tune betting filters on out-of-fold predictions (use --no-tune-strategy to disable).",
+    )
+    p_pipe.add_argument(
+        "--strategy-grid",
+        choices=["small", "medium", "large"],
+        default="small",
+        help="Grid size for strategy tuning.",
+    )
+    p_pipe.add_argument(
+        "--strategy-objective",
+        choices=["expected_roi", "roi", "expected_profit", "profit"],
+        default="expected_roi",
+        help="Metric to maximize during strategy tuning.",
+    )
+    p_pipe.add_argument(
+        "--strategy-min-hit-rate",
+        type=float,
+        default=0.05,
+        help="Minimum hit rate required for tuned configs.",
+    )
+    p_pipe.add_argument(
+        "--strategy-min-bets",
+        type=int,
+        default=200,
+        help="Minimum number of bets required for tuned configs.",
+    )
+    p_pipe.add_argument(
+        "--strategy-top-n",
+        type=int,
+        default=10,
+        help="Top configs to display after tuning.",
+    )
+    p_pipe.add_argument(
+        "--strategy-log-every",
+        type=int,
+        default=20,
+        help="Progress logging frequency during strategy tuning.",
+    )
+    p_pipe.add_argument(
+        "--strategy-output",
+        help="Optional CSV path to write strategy tuning results.",
+    )
     p_pipe.add_argument("--output")
     p_pipe.add_argument("--dry-run", action="store_true", help="Applied to scoring step")
     p_pipe.add_argument("--skip-features", action="store_true")
@@ -552,6 +743,14 @@ def build_parser() -> argparse.ArgumentParser:
                 show_bets=True,
                 bets_limit=20,
                 report=True,
+                tune_strategy=True,
+                strategy_grid="small",
+                strategy_objective="expected_roi",
+                strategy_min_hit_rate=0.05,
+                strategy_min_bets=200,
+                strategy_top_n=10,
+                strategy_log_every=20,
+                strategy_output=None,
             )
         )
     )

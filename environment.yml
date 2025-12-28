@@ -9,6 +9,7 @@ dependencies:
   - scikit-learn
   - joblib
   - python-dotenv
+  - requests
   - lightgbm
   - optuna
   - pytest

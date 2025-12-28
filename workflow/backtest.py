@@ -4,6 +4,7 @@ from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.training import load_model_and_calibrator, predict_probabilities
 from shared.storage.duckdb_store import DuckDBStore
+from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.progress import log
 
 
@@ -83,6 +84,8 @@ def main() -> None:
         else:
             log(f"Bet preview: top {len(preview)} bets by expected value.")
             print(preview.to_string(index=False))
+            for line in preview_legend_lines():
+                log(line)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from shared.backtest.engine import compute_expected_value
+from shared.utils.bet_explain import annotate_preview_frame
 
 
 def _select_price(feature_row: pd.Series, cutoff_minutes: int) -> float | None:
@@ -80,11 +81,25 @@ def build_prediction_preview(
     if per_market_limit:
         preview = preview.groupby("market_id").head(per_market_limit)
     preview = preview.sort_values("expected_value", ascending=False).head(limit)
+    preview = annotate_preview_frame(
+        preview,
+        selection_col="selection",
+        market_type_col="market_type",
+        default_bet_type="BACK",
+    )
     columns = [
         "race_start_time",
         "venue",
         "market_type",
+        "market_type_label",
         "selection",
+        "selection_label",
+        "runner_number",
+        "selection_kind",
+        "selection_notes",
+        "bet_type",
+        "bet_type_label",
+        "bet_guidance",
         "price",
         "p_hat",
         "implied_prob",

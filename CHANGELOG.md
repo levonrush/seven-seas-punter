@@ -28,3 +28,26 @@ All notable changes to this project will be documented in this file.
 - Added out-of-fold prediction previews and calibration driven by rolling CV folds.
 - Added default sanity filters (min edge, max price, edge multiplier) for previews and backtests.
 - Fixed markets upsert column order to populate market_type correctly.
+- Added human-readable market/selection/bet explanations and preview legends for new bettors.
+- Added bet guidance hints and clearer labels when market_type looks like a numeric event id.
+- Truncated long preview text columns to keep console tables aligned, keeping *_full columns for exports.
+- Added strategy tuning to optimize betting filters for ROI with hit-rate constraints and trade-off summary.
+- Enabled strategy tuning by default with `--no-tune-strategy` to opt out.
+- Added Betfair historic data downloader CLI and API client for automated archive creation.
+- Renamed `.env.example` to `.env.template`, added cert guidance, and ignored common certificate files.
+- Added auto historic download mode with manifest-based resume and force re-download flag.
+- Restored `.env.template` with clearer note that certs are optional on Betfair AU.
+- Ignored missing Betfair cert/key paths in API clients to avoid login failures with placeholders.
+- Added SSO login fallbacks and clearer error messages; optional `BETFAIR_SSO_URL` override for AU.
+- Accepted `token` as a fallback when SSO returns `status=SUCCESS` without `sessionToken`.
+- Added retry/backoff and auto-skip for historic download list failures, with CLI flags.
+- Added `download-historic` retry flags to the CLI wrapper.
+- Added `--clean-temp` to wipe the temp download folder before historic downloads.
+- Ignored downloaded archives and snapshot CSVs under `data/`.
+- Defaulted historic download retries to 5 with a 3s backoff.
+- `download-historic` now defaults to download when no list/size/show flags are set, and auto mode is assumed if no date range is provided.
+- Pipeline now auto-uses `data/data.tar` when present and skips ingest if the archive is missing.
+- Refined README onboarding and added a detailed modeling + leakage safeguards section.
+- Retried historic `list_files` on network/DNS errors and skipped month on failure in auto mode.
+- Defaulted historic download workers to half available cores (capped at 8) when unset.
+- Added retry/backoff for SSO login, configurable via `BETFAIR_SSO_RETRIES` and `BETFAIR_SSO_RETRY_WAIT`.
