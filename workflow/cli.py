@@ -171,35 +171,11 @@ def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | N
         return metrics.get("kappa_threshold")
     return None
 
-
-def _ensure_backtest_run_id(args: argparse.Namespace, store: DuckDBStore) -> None:
-    """Reuse the latest training run id for backtests when one is not provided."""
-    if getattr(args, "run_id", None):
-        return
-    cutoff = getattr(args, "cutoff_minutes", None)
-    with store._connect() as con:  # type: ignore[attr-defined]
-        row = con.execute(
-            """
-            SELECT run_id
-            FROM model_runs
-            WHERE run_id IS NOT NULL AND cutoff_minutes = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            [cutoff],
-        ).fetchone()
-    if row and row[0]:
-        args.run_id = row[0]
-        log(f"Backtest: using run id from latest model run ({args.run_id}).")
-
-
 def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None:
     """Set split_date to the last N days of data when requested."""
     if getattr(args, "split_date", None):
         return
     days = getattr(args, "split_days", None)
-    if days is None and getattr(args, "split_last_180", False):
-        days = 180
     if days is None and getattr(args, "split_last_month", False):
         days = 30
     if days is None:
