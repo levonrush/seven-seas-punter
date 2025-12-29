@@ -184,14 +184,15 @@ class DuckDBStore:
                 """
             )
 
-    def record_bets(self, bets: Iterable[Dict[str, Any]]) -> None:
-        """Persist simulated bets so backtests are auditable."""
+    def record_bets(self, bets: Iterable[Dict[str, Any]], run_id: Optional[str] = None) -> None:
+        """Persist simulated bets so backtests are auditable and traceable to a run."""
         df = pd.DataFrame(list(bets))
         if df.empty:
             return
         cols = [
             "market_id",
             "selection_id",
+            "run_id",
             "bet_time",
             "stake",
             "price",
@@ -200,6 +201,7 @@ class DuckDBStore:
             "commission_rate",
             "result_profit",
         ]
+        df["run_id"] = run_id
         for col in cols:
             if col not in df.columns:
                 df[col] = None
@@ -211,6 +213,7 @@ class DuckDBStore:
                 INSERT INTO bets (
                     market_id,
                     selection_id,
+                    run_id,
                     bet_time,
                     stake,
                     price,
@@ -230,15 +233,16 @@ class DuckDBStore:
         cutoff_minutes: int,
         metrics: Optional[Dict[str, Any]] = None,
         notes: str = "",
+        run_id: Optional[str] = None,
     ) -> None:
         """Log model artefact locations and metrics for traceability."""
         with self._connect() as con:
             con.execute(
                 """
-                INSERT INTO model_runs (model_path, calibrator_path, cutoff_minutes, metrics, notes)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO model_runs (model_path, calibrator_path, cutoff_minutes, metrics, notes, run_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                [model_path, calibrator_path, cutoff_minutes, metrics or {}, notes],
+                [model_path, calibrator_path, cutoff_minutes, metrics or {}, notes, run_id],
             )
 
     def load_snapshots(self) -> pd.DataFrame:
@@ -265,6 +269,14 @@ class DuckDBStore:
         """Return stored runners for joins."""
         with self._connect() as con:
             return con.execute("SELECT * FROM runners").df()
+
+    def max_race_start_time(self) -> Optional[pd.Timestamp]:
+        """Return the latest race_start_time available in markets."""
+        with self._connect() as con:
+            result = con.execute("SELECT MAX(race_start_time) FROM markets").fetchone()
+        if not result:
+            return None
+        return result[0]
 
     def table_row_count(self, table: str) -> int:
         """Return table row count so ingest steps can skip reprocessing when data already exists."""

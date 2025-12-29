@@ -5,6 +5,7 @@ dependencies:
   - python=3.12
   - pandas
   - numpy
+  - pyarrow
   - duckdb
   - scikit-learn
   - joblib

@@ -7,7 +7,6 @@ from typing import Dict, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss
@@ -47,6 +46,13 @@ class ProbabilityCalibrator:
         if self.method == "platt":
             return self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
         raise ValueError(f"Unknown calibration method: {self.method}")
+
+
+def _require_lightgbm():
+    """Ensure LightGBM is installed so training can use the required model."""
+    if lgb is None:
+        raise RuntimeError("LightGBM is required for training. Install it via environment.yml.")
+    return lgb
 
 
 def _feature_columns(df: pd.DataFrame) -> list[str]:
@@ -108,9 +114,10 @@ def _build_time_folds(
 
 def _build_model_from_params(best_params: Optional[dict]):
     """Instantiate a model using tuned params when possible."""
-    if best_params and lgb is not None:
-        return lgb.LGBMClassifier(**best_params)
-    return HistGradientBoostingClassifier(random_state=42)
+    lgb_module = _require_lightgbm()
+    if best_params:
+        return lgb_module.LGBMClassifier(**best_params)
+    return lgb_module.LGBMClassifier(random_state=42, verbosity=-1)
 
 
 def _compute_oof_raw_predictions(
@@ -142,8 +149,9 @@ def _bayes_optimize_lightgbm(
     n_trials: int = 20,
 ) -> tuple[Optional[dict], Optional[float]]:
     """Run a small Bayesian hyperparameter search for LightGBM; returns best params and score."""
-    if lgb is None or optuna is None:
-        log("Training: LightGBM/Optuna not available; skipping tuning.")
+    _require_lightgbm()
+    if optuna is None:
+        log("Training: Optuna not available; using LightGBM default params.")
         return None, None
 
     log(f"Training: Optuna tuning with {n_trials} trials.")
@@ -275,6 +283,7 @@ def train_and_calibrate(
     cv_folds: int = DEFAULT_CV_FOLDS,
     cv_gap_days: int = DEFAULT_CV_GAP_DAYS,
     cv_strategy: str = DEFAULT_CV_STRATEGY,
+    run_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Dict[str, float], Optional[pd.Series]]:
     """Train a tuned LightGBM model with rolling CV and return out-of-fold calibrated predictions."""
     df = features_df.dropna(subset=["win_target"])
@@ -282,6 +291,7 @@ def train_and_calibrate(
         log("Training: no labeled rows; skipping model training.")
         return None, None, {}, None
 
+    _require_lightgbm()
     X = df[_feature_columns(df)].fillna(0.0)
     y = df["win_target"].astype(int)
     groups = df["market_id"] if "market_id" in df.columns else None
@@ -303,10 +313,10 @@ def train_and_calibrate(
         model_label = "LightGBM (Optuna tuned)"
         log("Training: using LightGBM (Optuna tuned).")
     else:
-        base_model = HistGradientBoostingClassifier(random_state=42)
+        base_model = lgb.LGBMClassifier(random_state=42, verbosity=-1)
         base_model.fit(X, y)
-        model_label = "HistGradientBoosting fallback"
-        log("Training: using HistGradientBoosting fallback.")
+        model_label = "LightGBM (default params)"
+        log("Training: using LightGBM default params (Optuna unavailable).")
 
     calibrator = None
     oof_predictions = None
@@ -375,6 +385,7 @@ def train_and_calibrate(
             cutoff_minutes=cutoff_minutes,
             metrics=metrics,
             notes=f"{model_label} + {calibration_note} calibration",
+            run_id=run_id,
         )
 
     return str(model_path), str(calibrator_path), metrics, oof_predictions

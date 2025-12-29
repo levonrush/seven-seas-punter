@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS results (
 CREATE TABLE IF NOT EXISTS bets (
     market_id TEXT,
     selection_id BIGINT,
+    run_id TEXT,
     bet_time TIMESTAMP,
     stake DOUBLE,
     price DOUBLE,
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS bets (
 
 CREATE TABLE IF NOT EXISTS model_runs (
     created_at TIMESTAMP DEFAULT now(),
+    run_id TEXT,
     model_path TEXT,
     calibrator_path TEXT,
     cutoff_minutes INTEGER,
@@ -64,3 +66,5 @@ CREATE TABLE IF NOT EXISTS model_runs (
 );
 
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS market_type TEXT;
+ALTER TABLE bets ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS run_id TEXT;

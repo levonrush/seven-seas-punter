@@ -10,6 +10,7 @@ __pycache__/
 data/*.duckdb
 data/*.parquet
 data/historic_manifest.json
+data/historic_lists/
 data/**/*.bz2
 data/**/*.tar
 data/**/*.tar.gz

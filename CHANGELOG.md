@@ -51,3 +51,10 @@ All notable changes to this project will be documented in this file.
 - Retried historic `list_files` on network/DNS errors and skipped month on failure in auto mode.
 - Defaulted historic download workers to half available cores (capped at 8) when unset.
 - Added retry/backoff for SSO login, configurable via `BETFAIR_SSO_RETRIES` and `BETFAIR_SSO_RETRY_WAIT`.
+- Added run-scoped reporting with `run_id` to align train/backtest metrics.
+- Added `--split-days` for last-N-day splits (plus `--split-last-month` for 30 days).
+- Removed HistGradientBoosting fallback; LightGBM is now required (Optuna still optional for tuning).
+- Added `pyarrow` to the conda environment to enable Parquet exports.
+- Fixed calibration method error caused by a misplaced indentation.
+- Cached historic `DownloadListOfFiles` responses to avoid repeat API calls (`data/historic_lists/`).
+- Defaulted historic downloads to 1 worker to reduce API throttling.

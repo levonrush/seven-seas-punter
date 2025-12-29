@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import datetime as dt
+import hashlib
 import json
 import os
 import shutil
@@ -34,9 +35,7 @@ def _resolve_workers(value: int | None) -> tuple[int, bool]:
     """Choose a safe default worker count for downloads."""
     if value and value > 0:
         return value, False
-    cpu_count = os.cpu_count() or 4
-    auto = max(2, min(8, cpu_count // 2))
-    return auto, True
+    return 1, True
 
 
 def _default_output(from_date: dt.date, to_date: dt.date) -> Path:
@@ -75,6 +74,35 @@ def _save_manifest(path: Path, manifest: dict) -> None:
     manifest["updated_at"] = dt.datetime.utcnow().isoformat()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _list_cache_path(cache_dir: Path, from_date: dt.date, to_date: dt.date, plan: str, payload: dict) -> Path:
+    """Build a deterministic cache path for a list_files payload."""
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    plan_slug = plan.lower().replace(" ", "-")
+    name = f"list_{plan_slug}_{from_date.isoformat()}_{to_date.isoformat()}_{digest}.json"
+    return cache_dir / name
+
+
+def _load_cached_list(path: Path) -> list[str] | None:
+    """Load cached list_files output when present and valid."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        return [str(item) for item in data]
+    return None
+
+
+def _save_cached_list(path: Path, files: list[str]) -> None:
+    """Persist list_files output for reuse in later runs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(list(files), indent=2), encoding="utf-8")
 
 
 def _mark_downloaded(manifest: dict, file_path: str, dest: Path) -> None:
@@ -179,7 +207,8 @@ def run_download_historic(args: argparse.Namespace) -> None:
     workers, auto_workers = _resolve_workers(args.workers)
     args.workers = workers
     if auto_workers:
-        log(f"Historic download: using {workers} workers (auto).")
+        label = "worker" if workers == 1 else "workers"
+        log(f"Historic download: using {workers} {label} (default).")
     market_types = _split_csv(args.market_types)
     countries = _split_csv(args.countries)
     file_types = _split_csv(args.file_types)
@@ -188,11 +217,15 @@ def run_download_historic(args: argparse.Namespace) -> None:
 
     manifest_path = Path(args.manifest_path or "data/historic_manifest.json")
     manifest = _load_manifest(manifest_path)
+    list_cache_dir = Path(args.list_cache_dir) if getattr(args, "list_cache_dir", None) else None
+    if list_cache_dir:
+        list_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def handle_window(from_date: dt.date, to_date: dt.date, plan: str) -> List[str]:
+        plan_name = plan or args.plan or "Basic Plan"
         payload = build_filter(
             sport=args.sport,
-            plan=plan,
+            plan=plan_name,
             from_day=from_date.day,
             from_month=from_date.month,
             from_year=from_date.year,
@@ -215,47 +248,58 @@ def run_download_historic(args: argparse.Namespace) -> None:
             print(dump_json(size))
             return []
         files = []
+        cache_path = None
+        if list_cache_dir:
+            cache_path = _list_cache_path(list_cache_dir, from_date, to_date, plan_name, payload)
+            if not args.refresh_list_cache:
+                cached = _load_cached_list(cache_path)
+                if cached is not None:
+                    files = cached
+                    log(f"Historic download: using cached file list {cache_path.name}.")
         last_error = None
-        for attempt in range(1, args.retries + 1):
-            try:
-                files = client.list_files(payload)
-                last_error = None
-                break
-            except requests.HTTPError as exc:
-                last_error = exc
-                status = exc.response.status_code if exc.response else "unknown"
-                body = (exc.response.text or "").strip().replace("\n", " ") if exc.response else ""
-                snippet = body[:200] if body else str(exc)
-                log(
-                    "Historic download: "
-                    f"{from_date.isoformat()} to {to_date.isoformat()} ({plan}) "
-                    f"list_files failed (HTTP {status}). {snippet}"
-                )
-                if attempt < args.retries and exc.response and exc.response.status_code >= 500:
-                    sleep_for = args.retry_wait * attempt
-                    log(f"Historic download: retrying in {sleep_for}s (attempt {attempt}/{args.retries}).")
-                    time.sleep(sleep_for)
-                    continue
-                if args.auto:
-                    return []
-                raise
-            except requests.RequestException as exc:
-                last_error = exc
-                log(
-                    "Historic download: "
-                    f"{from_date.isoformat()} to {to_date.isoformat()} ({plan}) "
-                    f"list_files failed ({exc})."
-                )
-                if attempt < args.retries:
-                    sleep_for = args.retry_wait * attempt
-                    log(f"Historic download: retrying in {sleep_for}s (attempt {attempt}/{args.retries}).")
-                    time.sleep(sleep_for)
-                    continue
-                if args.auto:
-                    return []
-                raise
+        if not files:
+            for attempt in range(1, args.retries + 1):
+                try:
+                    files = client.list_files(payload)
+                    last_error = None
+                    break
+                except requests.HTTPError as exc:
+                    last_error = exc
+                    status = exc.response.status_code if exc.response else "unknown"
+                    body = (exc.response.text or "").strip().replace("\n", " ") if exc.response else ""
+                    snippet = body[:200] if body else str(exc)
+                    log(
+                        "Historic download: "
+                        f"{from_date.isoformat()} to {to_date.isoformat()} ({plan_name}) "
+                        f"list_files failed (HTTP {status}). {snippet}"
+                    )
+                    if attempt < args.retries and exc.response and exc.response.status_code >= 500:
+                        sleep_for = args.retry_wait * attempt
+                        log(f"Historic download: retrying in {sleep_for}s (attempt {attempt}/{args.retries}).")
+                        time.sleep(sleep_for)
+                        continue
+                    if args.auto:
+                        return []
+                    raise
+                except requests.RequestException as exc:
+                    last_error = exc
+                    log(
+                        "Historic download: "
+                        f"{from_date.isoformat()} to {to_date.isoformat()} ({plan_name}) "
+                        f"list_files failed ({exc})."
+                    )
+                    if attempt < args.retries:
+                        sleep_for = args.retry_wait * attempt
+                        log(f"Historic download: retrying in {sleep_for}s (attempt {attempt}/{args.retries}).")
+                        time.sleep(sleep_for)
+                        continue
+                    if args.auto:
+                        return []
+                    raise
         if last_error and not files:
             return []
+        if files and list_cache_dir and cache_path:
+            _save_cached_list(cache_path, files)
         if args.max_files:
             files = files[: args.max_files]
         if args.list_only or not args.download:
@@ -400,6 +444,16 @@ def main() -> None:
     parser.add_argument("--size-only", action="store_true", help="Only show file count and size.")
     parser.add_argument("--list-only", action="store_true", help="Only list available files.")
     parser.add_argument("--list-output", help="Optional path to write the file list JSON.")
+    parser.add_argument(
+        "--list-cache-dir",
+        default="data/historic_lists",
+        help="Cache list_files responses (set empty to disable).",
+    )
+    parser.add_argument(
+        "--refresh-list-cache",
+        action="store_true",
+        help="Ignore cached file lists and refresh from the API.",
+    )
     parser.add_argument("--download", action="store_true", help="Download the files.")
     parser.add_argument("--output", help="Output tar path (defaults to data/historic_*.tar).")
     parser.add_argument("--output-dir", help="Directory to store downloads before tarring.")

@@ -130,6 +130,8 @@ One wrapper to run individual steps or a full pipeline:
 ```bash
 # Ingest stream tar, build features, train, backtest, and score (dry-run scoring by default)
 punter pipeline --cutoff-minutes 10 --split-date 2023-01-01 --dry-run  # uses data/data.tar if present; auto-prints report + predictions; use --no-report/--no-show-preds
+punter pipeline --cutoff-minutes 10 --split-days 180  # auto-sets split-date to last N days
+punter pipeline --cutoff-minutes 10 --split-last-month  # auto-sets split-date to last 30 days
 
 # Or run individual subcommands:
 punter ingest --archive data/data.tar
@@ -138,7 +140,11 @@ punter download-historic --from-date 2017-03-01 --to-date 2017-03-31 --market-ty
 punter download-historic --auto --market-types WIN --countries AU --file-types M --download --output data/data.tar  # auto-resume
 punter features --cutoff-minutes 10
 punter train --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints report + predictions; use --no-report/--no-show-preds
+punter train --cutoff-minutes 10 --split-days 180
+punter train --cutoff-minutes 10 --split-last-month
 punter backtest --cutoff-minutes 10 --split-date 2023-01-01  # auto-prints top bets; use --no-show-bets
+punter backtest --cutoff-minutes 10 --split-days 180
+punter backtest --cutoff-minutes 10 --split-last-month
 punter score --cutoff-minutes 10 --dry-run
 punter status
 punter report
@@ -157,7 +163,7 @@ What we model (v1):
 - Target is `win_target` (1 if winner else 0); place targets are optional and only used when reliable.
 
 Training and calibration:
-- Default model is LightGBM tuned with Optuna (Bayesian search); falls back to HistGradientBoosting if missing.
+- Default model is LightGBM tuned with Optuna (Bayesian search); if Optuna is missing, LightGBM uses default params.
 - Tuning uses rolling time-based CV (expanding windows) over `race_start_time` with a gap day.
 - Out-of-fold (OOF) predictions from the time folds are used for calibration (isotonic, fallback Platt).
 - Metrics are computed on OOF predictions to avoid training-set bias.
@@ -173,10 +179,15 @@ Leakage mitigations:
 - Betfair integration uses `betfairlightweight`. Missing credentials automatically enable dry-run mock data.
 - Historic data automation uses the Betfair historic API (SSO session token from your app key + credentials). Certificates are optional and mainly for headless automation.
 - Historic downloads keep a manifest at `data/historic_manifest.json` so reruns only fetch new files; use `--force` to re-download.
-- Model training uses LightGBM tuned with Optuna (Bayesian search) when available; it falls back to scikit-learn HistGradientBoosting if LightGBM/Optuna are missing. Tuning uses rolling time-based CV by default.
+- Historic downloads cache file lists under `data/historic_lists/` to avoid repeated list calls; use `--refresh-list-cache` to refresh or set `--list-cache-dir ""` to disable.
+- Historic downloads default to 1 worker to reduce API throttling; increase with `--workers`.
+- Model training uses LightGBM tuned with Optuna (Bayesian search) when available; if Optuna is missing, LightGBM uses default params. Tuning uses rolling time-based CV by default.
 - Use `--split-date` to keep training and backtests leakage-safe (train on races before the date, test on races after).
+- Use `--split-days N` to set `--split-date` to the most recent N days of data.
+- Use `--split-last-month` for a quick 30-day split.
 - Prediction previews after training are based on out-of-fold probabilities from the rolling CV folds.
 - Training metrics are computed from out-of-fold predictions (no holdout required).
 - Preview/backtest filters default to `min_ev=0.02`, `min_edge=0.1`, `max_price=200`, `max_edge_mult=5`. Override with `--preds-*` or `--min-edge/--max-price/--max-edge-mult`.
 - All functions use snake_case and include docstrings describing purpose + behavior.
 - Models are saved in `artifacts/` and tracked in DuckDB `model_runs`.
+- Reports align model runs and backtests via `run_id`; pass `--run-id` to `train`, `backtest`, `pipeline`, or `report` to pin a specific run.

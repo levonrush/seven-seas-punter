@@ -2,6 +2,9 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+import uuid
+
+import pandas as pd
 
 from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.backtest.strategy_tuner import tune_strategy
@@ -67,6 +70,36 @@ def cmd_download_historic(args: argparse.Namespace) -> None:
     run_download_historic(args)
 
 
+def _ensure_run_id(args: argparse.Namespace) -> None:
+    """Assign a run id so training/backtests can be tied to a single CLI execution."""
+    if getattr(args, "run_id", None):
+        return
+    args.run_id = uuid.uuid4().hex
+    log(f"Run id: {args.run_id}")
+
+
+def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None:
+    """Set split_date to the last N days of data when requested."""
+    if getattr(args, "split_date", None):
+        return
+    days = getattr(args, "split_days", None)
+    if days is None and getattr(args, "split_last_month", False):
+        days = 30
+    if days is None:
+        return
+    if days <= 0:
+        log("Split date: split-days must be positive; skipping.")
+        return
+    max_time = store.max_race_start_time()
+    if not max_time:
+        log("Split date: no market data found; skipping split-days.")
+        return
+    split_date = (pd.to_datetime(max_time) - dt.timedelta(days=days)).isoformat()
+    args.split_date = split_date
+    label = "last month" if days == 30 else f"last {days} days"
+    log(f"Split date set to {split_date} ({label}).")
+
+
 def cmd_features(args: argparse.Namespace) -> None:
     """Build features at a cutoff minute and save Parquet."""
     print(f"Building features (cutoff T-{args.cutoff_minutes})...")
@@ -87,6 +120,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     """Train LightGBM (Optuna tuned) + calibrator and persist artefacts."""
     print(f"Training model (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    _ensure_run_id(args)
+    _apply_split_from_days(args, store)
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
     train_features = features
     test_features = None
@@ -103,6 +138,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         cutoff_minutes=args.cutoff_minutes,
         store=store,
         split_date=getattr(args, "split_date", None),
+        run_id=getattr(args, "run_id", None),
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
     if getattr(args, "show_preds", True):
@@ -192,6 +228,8 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest value strategy using trained model (or implied probs fallback)."""
     print(f"Backtesting (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    _ensure_run_id(args)
+    _apply_split_from_days(args, store)
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
     if getattr(args, "split_date", None):
         _, features = split_features_by_race_time(features, args.split_date)
@@ -222,7 +260,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         max_edge_multiplier=args.max_edge_mult,
         stake=args.stake,
     )
-    store.record_bets(bets.to_dict(orient="records"))
+    store.record_bets(bets.to_dict(orient="records"), run_id=getattr(args, "run_id", None))
     log(f"Backtest metrics: {metrics}")
     if getattr(args, "show_bets", True):
         preview = build_bet_preview(
@@ -335,28 +373,59 @@ def cmd_report(args: argparse.Namespace) -> None:
     """Print latest model metrics and backtest profit summary."""
     store = DuckDBStore()
     with store._connect() as con:  # type: ignore[attr-defined]
-        model_row = con.execute(
-            """
-            SELECT created_at, cutoff_minutes, model_path, calibrator_path, metrics
-            FROM model_runs
-            ORDER BY created_at DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        bet_row = con.execute(
-            """
-            SELECT
-                COUNT(*) AS bets,
-                SUM(stake) AS turnover,
-                SUM(result_profit) AS profit,
-                SUM(expected_value * stake) AS expected_profit,
-                SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
-            FROM bets
-            """
-        ).fetchone()
+        run_id = getattr(args, "run_id", None)
+        if run_id:
+            model_row = con.execute(
+                """
+                SELECT created_at, cutoff_minutes, model_path, calibrator_path, metrics, run_id
+                FROM model_runs
+                WHERE run_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [run_id],
+            ).fetchone()
+        else:
+            model_row = con.execute(
+                """
+                SELECT created_at, cutoff_minutes, model_path, calibrator_path, metrics, run_id
+                FROM model_runs
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            run_id = model_row[5] if model_row else None
+        if run_id:
+            bet_row = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS bets,
+                    SUM(stake) AS turnover,
+                    SUM(result_profit) AS profit,
+                    SUM(expected_value * stake) AS expected_profit,
+                    SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
+                FROM bets
+                WHERE run_id = ?
+                """,
+                [run_id],
+            ).fetchone()
+        else:
+            bet_row = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS bets,
+                    SUM(stake) AS turnover,
+                    SUM(result_profit) AS profit,
+                    SUM(expected_value * stake) AS expected_profit,
+                    SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
+                FROM bets
+                """
+            ).fetchone()
 
     if model_row:
-        created_at, cutoff_minutes, model_path, calibrator_path, metrics = model_row
+        created_at, cutoff_minutes, model_path, calibrator_path, metrics, model_run_id = model_row
+        if model_run_id:
+            log(f"Run id: {model_run_id}")
         if isinstance(metrics, str):
             try:
                 metrics = json.loads(metrics)
@@ -385,6 +454,7 @@ def cmd_report(args: argparse.Namespace) -> None:
 def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
     log("Starting pipeline...")
+    _ensure_run_id(args)
     if args.archive:
         archive_path = pathlib.Path(args.archive)
         if not archive_path.exists():
@@ -408,7 +478,10 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
         cmd_features(args)
     if not args.skip_train:
         log("Step: train model")
+        report_flag = getattr(args, "report", False)
+        args.report = False
         cmd_train(args)
+        args.report = report_flag
     if not args.skip_backtest:
         log("Step: backtest")
         cmd_backtest(args)
@@ -456,13 +529,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_hist.add_argument("--size-only", action="store_true", help="Only show file count and size.")
     p_hist.add_argument("--list-only", action="store_true", help="Only list available files.")
     p_hist.add_argument("--list-output", help="Optional path to write the file list JSON.")
+    p_hist.add_argument(
+        "--list-cache-dir",
+        default="data/historic_lists",
+        help="Cache list_files responses (set empty to disable).",
+    )
+    p_hist.add_argument(
+        "--refresh-list-cache",
+        action="store_true",
+        help="Ignore cached file lists and refresh from the API.",
+    )
     p_hist.add_argument("--download", action="store_true", help="Download the files.")
     p_hist.add_argument("--output", help="Output tar path (defaults to data/historic_*.tar).")
     p_hist.add_argument("--output-dir", help="Directory to store downloads before tarring.")
     p_hist.add_argument("--keep-files", action="store_true", help="Keep downloaded files on disk.")
     p_hist.add_argument("--clean-temp", action="store_true", help="Remove temp download dir before starting.")
     p_hist.add_argument("--max-files", type=int, help="Limit number of files (useful for testing).")
-    p_hist.add_argument("--workers", type=int, default=None, help="Parallel download workers.")
+    p_hist.add_argument("--workers", type=int, default=None, help="Parallel download workers (default 1).")
     p_hist.add_argument("--progress-every", type=int, default=50, help="Progress logging frequency.")
     p_hist.add_argument("--manifest-path", help="Path for download manifest JSON.")
     p_hist.add_argument("--force", action="store_true", help="Re-download files even if seen before.")
@@ -480,6 +563,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-date",
         help="ISO date/time; training uses races strictly before this (leakage-safe split).",
     )
+    p_train.add_argument(
+        "--split-last-month",
+        action="store_true",
+        help="Set split-date to the last 30 days of available data.",
+    )
+    p_train.add_argument(
+        "--split-days",
+        type=int,
+        help="Set split-date to the last N days of available data.",
+    )
+    p_train.add_argument("--run-id", help="Optional run id to align training/backtests/reports.")
     p_train.add_argument(
         "--show-preds",
         action=argparse.BooleanOptionalAction,
@@ -579,6 +673,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO date/time; backtest uses races on/after this (holdout set).",
     )
     p_bt.add_argument(
+        "--split-last-month",
+        action="store_true",
+        help="Set split-date to the last 30 days of available data.",
+    )
+    p_bt.add_argument(
+        "--split-days",
+        type=int,
+        help="Set split-date to the last N days of available data.",
+    )
+    p_bt.add_argument("--run-id", help="Optional run id to align backtests/reports.")
+    p_bt.add_argument(
         "--show-bets",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -613,6 +718,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-date",
         help="ISO date/time; train uses races before this, backtest uses on/after.",
     )
+    p_pipe.add_argument(
+        "--split-last-month",
+        action="store_true",
+        help="Set split-date to the last 30 days of available data.",
+    )
+    p_pipe.add_argument(
+        "--split-days",
+        type=int,
+        help="Set split-date to the last N days of available data.",
+    )
+    p_pipe.add_argument("--run-id", help="Optional run id to align pipeline/reports.")
     p_pipe.add_argument(
         "--show-preds",
         action=argparse.BooleanOptionalAction,
@@ -759,6 +875,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.set_defaults(func=cmd_status)
 
     p_report = sub.add_parser("report", help="Show latest model metrics and backtest summary")
+    p_report.add_argument("--run-id", help="Optional run id to report on.")
     p_report.set_defaults(func=cmd_report)
 
     return parser
