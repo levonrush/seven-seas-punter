@@ -1,0 +1,22 @@
+# Betfair integration
+
+This module wraps Betfair API-NG for live markets and the Historic Data API for archive downloads.
+
+## Environment variables
+Required for historic downloads:
+- `BETFAIR_APP_KEY`
+- `BETFAIR_USERNAME`
+- `BETFAIR_PASSWORD`
+
+Optional (AU accounts can run without certs):
+- `BETFAIR_CERT_FILE`
+- `BETFAIR_KEY_FILE`
+
+Optional SSO overrides and retries:
+- `BETFAIR_SSO_URL` (e.g., `https://identitysso.betfair.com.au/api/login`)
+- `BETFAIR_SSO_RETRIES`
+- `BETFAIR_SSO_RETRY_WAIT`
+
+## Files
+- `client.py`: lightweight wrapper used by workflow scoring.
+- `historic.py`: historic API client used by the downloader.

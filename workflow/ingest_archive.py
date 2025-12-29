@@ -18,6 +18,32 @@ ALLOWED_COUNTRIES = {"AU"}
 ALLOWED_MARKET_TYPES = {"WIN"}
 
 
+def _load_ingest_manifest(path: Path) -> Dict:
+    """Load or initialize an ingest manifest for archive members."""
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        data = {"members": {}, "version": 1}
+    members = data.get("members") or {}
+    data["members"] = members
+    data["_members"] = set(members.keys())
+    return data
+
+
+def _save_ingest_manifest(path: Path, manifest: Dict) -> None:
+    """Persist ingest manifest state to disk."""
+    manifest = {k: v for k, v in manifest.items() if not k.startswith("_")}
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _record_ingested(manifest: Dict, member_name: str) -> None:
+    """Record a processed archive member in the manifest."""
+    manifest["members"][member_name] = {"ingested_at": datetime.now(timezone.utc).isoformat()}
+    manifest["_members"].add(member_name)
+
+
 def _load_member_as_df(tar: tarfile.TarFile, member: tarfile.TarInfo) -> pd.DataFrame:
     """Read a tar member into a DataFrame, supporting CSV and Parquet."""
     with tar.extractfile(member) as fh:  # type: ignore[arg-type]
@@ -253,6 +279,10 @@ def _ingest_bz_stream_archive(
     progress_every: int = 100,
     workers: int | None = None,
     filter_au_win: bool = False,
+    member_names: set[str] | None = None,
+    manifest: Dict | None = None,
+    manifest_path: Path | None = None,
+    save_every: int = 100,
 ) -> Dict[str, int]:
     """Parse Betfair historical stream (.bz2 inside tar) and write to DuckDB."""
     counts = {"snapshots": 0, "markets": 0, "runners": 0, "results": 0, "skipped_markets": 0}
@@ -260,6 +290,8 @@ def _ingest_bz_stream_archive(
     buffer: List[Dict] = []
     with tarfile.open(archive_path, "r") as tar:
         members = [m for m in tar.getmembers() if m.isfile() and m.name.endswith(".bz2")]
+        if member_names is not None:
+            members = [m for m in members if m.name in member_names]
         log(f"Found {len(members)} stream files in archive.")
         if workers is None:
             cpu_count = os.cpu_count() or 2
@@ -287,10 +319,16 @@ def _ingest_bz_stream_archive(
                             chunk = snapshot_rows[i : i + flush_every]
                             store.append_snapshots(chunk)
                             counts["snapshots"] += len(chunk)
+                    if manifest is not None:
+                        _record_ingested(manifest, result.get("name", ""))
+                        if manifest_path and save_every and idx % save_every == 0:
+                            _save_ingest_manifest(manifest_path, manifest)
                     if progress_every and idx % progress_every == 0:
                         log(
                             f"Processed {idx}/{len(tasks)} files; snapshots={counts['snapshots']} markets={counts['markets']}"
                         )
+            if manifest is not None and manifest_path:
+                _save_ingest_manifest(manifest_path, manifest)
             return counts
         for idx, member in enumerate(members, start=1):
             if progress_every and idx % progress_every == 0:
@@ -332,18 +370,34 @@ def _ingest_bz_stream_archive(
                                     counts["snapshots"] += len(buffer)
                                     log(f"Flushed {len(buffer)} snapshots (total {counts['snapshots']}).")
                                     buffer = []
+            if manifest is not None:
+                _record_ingested(manifest, member.name)
+                if manifest_path and save_every and idx % save_every == 0:
+                    _save_ingest_manifest(manifest_path, manifest)
     if buffer:
         store.append_snapshots(buffer)
         counts["snapshots"] += len(buffer)
         log(f"Final flush: {len(buffer)} snapshots (total {counts['snapshots']}).")
+    if manifest is not None and manifest_path:
+        _save_ingest_manifest(manifest_path, manifest)
     return counts
 
 
-def _ingest_tabular_archive(archive_path: Path, store: DuckDBStore, progress_every: int = 10) -> Dict[str, int]:
+def _ingest_tabular_archive(
+    archive_path: Path,
+    store: DuckDBStore,
+    progress_every: int = 10,
+    member_names: set[str] | None = None,
+    manifest: Dict | None = None,
+    manifest_path: Path | None = None,
+    save_every: int = 50,
+) -> Dict[str, int]:
     """Load CSV/Parquet tables from tar into DuckDB (legacy path)."""
     ingested = {}
     with tarfile.open(archive_path, "r") as tar:
         members = [m for m in tar.getmembers() if m.isfile()]
+        if member_names is not None:
+            members = [m for m in members if m.name in member_names]
         log(f"Found {len(members)} files in archive.")
         for idx, member in enumerate(members, start=1):
             if progress_every and idx % progress_every == 0:
@@ -362,6 +416,12 @@ def _ingest_tabular_archive(archive_path: Path, store: DuckDBStore, progress_eve
             df = _load_member_as_df(tar, member)
             _emit(store, table, df)
             ingested[table] = ingested.get(table, 0) + len(df)
+            if manifest is not None:
+                _record_ingested(manifest, member.name)
+                if manifest_path and save_every and idx % save_every == 0:
+                    _save_ingest_manifest(manifest_path, manifest)
+    if manifest is not None and manifest_path:
+        _save_ingest_manifest(manifest_path, manifest)
     return ingested
 
 
@@ -384,6 +444,15 @@ def main() -> None:
         action="store_true",
         help="Re-ingest even if snapshots already exist in DuckDB.",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Only ingest new archive members (uses ingest manifest; auto-enabled when manifest exists).",
+    )
+    parser.add_argument(
+        "--ingest-manifest",
+        help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
+    )
     args = parser.parse_args()
 
     log(
@@ -395,12 +464,35 @@ def main() -> None:
 
     store = DuckDBStore()
 
-    if not args.force_ingest and store.has_data("snapshots"):
+    incremental = args.incremental
+    manifest_path = None
+    manifest_candidate = Path(args.ingest_manifest or "data/ingest_manifest.json")
+    if incremental or args.ingest_manifest:
+        manifest_path = manifest_candidate
+    snapshots_exist = store.has_data("snapshots")
+    if snapshots_exist and not args.force_ingest and not incremental and manifest_candidate.exists():
+        incremental = True
+        manifest_path = manifest_candidate
+        log(f"Ingest: manifest found; using incremental ingest ({manifest_candidate}).")
+    if snapshots_exist:
         existing = store.table_row_count("snapshots")
-        log(
-            f"Ingest: snapshots already present ({existing} rows); skipping ingest. Use --force-ingest to re-run."
-        )
-        return
+        if not args.force_ingest and not incremental:
+            log(
+                f"Ingest: snapshots already present ({existing} rows); skipping ingest. "
+                "Use --force-ingest to re-run."
+            )
+            return
+        if incremental:
+            if manifest_path and not manifest_path.exists():
+                log(
+                    "Ingest: incremental manifest missing; "
+                    "this will ingest all members and may duplicate data."
+                )
+            else:
+                log(
+                    f"Ingest: snapshots already present ({existing} rows); "
+                    "ingesting only new archive members."
+                )
 
     counts = ingest_archive_file(
         archive_path,
@@ -409,6 +501,9 @@ def main() -> None:
         progress_every=args.progress_every,
         workers=args.workers,
         filter_au_win=args.filter_au_win,
+        incremental=incremental,
+        manifest_path=manifest_path,
+        force=args.force_ingest,
     )
     log(f"Ingested rows: {counts}")
     log("Ingest: complete.")
@@ -421,12 +516,32 @@ def ingest_archive_file(
     progress_every: int = 100,
     workers: int | None = None,
     filter_au_win: bool = False,
+    incremental: bool = False,
+    manifest_path: Path | None = None,
+    force: bool = False,
 ) -> Dict[str, int]:
     """Public helper to ingest a tar archive into DuckDB (stream or tabular)."""
+    counts = {"snapshots": 0, "markets": 0, "runners": 0, "results": 0, "skipped_markets": 0}
+    manifest = None
+    member_names: set[str] | None = None
+    if incremental:
+        manifest_path = manifest_path or Path("data/ingest_manifest.json")
+        manifest = _load_ingest_manifest(manifest_path)
     # Detect type by looking for .bz2 members
     with tarfile.open(archive_path, "r") as tar:
-        members = tar.getmembers()
-        has_bz2 = any(m.name.endswith(".bz2") for m in members if m.isfile())
+        members = [m for m in tar.getmembers() if m.isfile()]
+        has_bz2 = any(m.name.endswith(".bz2") for m in members)
+        if incremental and manifest is not None and not force:
+            relevant = [m for m in members if m.name.endswith(".bz2")] if has_bz2 else members
+            new_names = {m.name for m in relevant} - manifest["_members"]
+            if not new_names:
+                log("Ingest: no new archive members detected; skipping.")
+                return counts
+            log(
+                "Ingest: incremental mode; "
+                f"{len(new_names)}/{len(relevant)} new members to ingest."
+            )
+            member_names = new_names
 
     if has_bz2:
         log("Detected Betfair stream archive (.bz2).")
@@ -437,9 +552,21 @@ def ingest_archive_file(
             progress_every=progress_every,
             workers=workers,
             filter_au_win=filter_au_win,
+            member_names=member_names,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            save_every=progress_every or 100,
         )
     log("Detected tabular archive (CSV/Parquet).")
-    return _ingest_tabular_archive(archive_path, store, progress_every=progress_every)
+    return _ingest_tabular_archive(
+        archive_path,
+        store,
+        progress_every=progress_every,
+        member_names=member_names,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        save_every=progress_every or 50,
+    )
 
 
 if __name__ == "__main__":

@@ -4,14 +4,14 @@
   "max_price": 100.0,
   "max_edge_mult": 5.0,
   "max_spread": 1.0,
-  "bets": 6720.0,
-  "profit": 461.12999999999977,
-  "expected_profit": 1771.866281827211,
-  "turnover": 6720.0,
-  "roi": 0.06862053571428568,
-  "expected_roi": 0.2636705776528588,
-  "hit_rate": 0.08392857142857142,
-  "max_drawdown": -572.1089999999996,
+  "bets": 165839.0,
+  "profit": -2517.6160000000073,
+  "expected_profit": 32734.06132879096,
+  "turnover": 165839.0,
+  "roi": -0.015181085269448122,
+  "expected_roi": 0.19738457979601276,
+  "hit_rate": 0.05837589469304567,
+  "max_drawdown": -6594.909999999958,
   "avg_price_improvement": NaN,
-  "score": 0.2636705776528588
+  "score": 0.19738457979601276
 }

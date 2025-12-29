@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("--max-spread", type=float, default=1.0)
     parser.add_argument("--max-price", type=float, default=200.0)
     parser.add_argument("--max-edge-mult", type=float, default=5.0)
+    parser.add_argument("--min-prob", type=float, default=None)
     parser.add_argument("--stake", type=float, default=1.0)
     parser.add_argument("--model-path", type=str, default=None, help="Optional explicit model path.")
     parser.add_argument("--calibrator-path", type=str, default=None, help="Optional calibrator path.")
@@ -67,6 +68,7 @@ def main() -> None:
         max_spread=args.max_spread,
         max_price=args.max_price,
         max_edge_multiplier=args.max_edge_mult,
+        min_prob=args.min_prob,
         stake=args.stake,
     )
     log(f"Backtest metrics: {metrics}")

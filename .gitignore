@@ -10,6 +10,7 @@ __pycache__/
 data/*.duckdb
 data/*.parquet
 data/historic_manifest.json
+data/ingest_manifest.json
 data/historic_lists/
 data/**/*.bz2
 data/**/*.tar
@@ -19,3 +20,7 @@ artifacts/*.joblib
 artifacts/*.csv
 *.pyc
 .venv/
+data/data.tar
+data/db_new.duckdb.wal
+data/data.tar
+.DS_Store

@@ -30,6 +30,7 @@ def main() -> None:
     parser.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     parser.add_argument("--dry-run", action="store_true", help="Use mock data even if credentials exist.")
     parser.add_argument("--output", type=str, default=None, help="Optional output CSV path.")
+    parser.add_argument("--min-prob", type=float, default=None, help="Optional min probability filter.")
     args = parser.parse_args()
 
     today = dt.date.today()
@@ -67,6 +68,13 @@ def main() -> None:
         probs = implied.fillna(implied.mean())
 
     features["p_hat"] = probs
+    if args.min_prob is not None:
+        before = len(features)
+        features = features[features["p_hat"] >= args.min_prob].copy()
+        log(f"Score: applied min_prob={args.min_prob:.3f} ({len(features)}/{before} rows).")
+        if features.empty:
+            log("No rows remain after min_prob filter.")
+            return
     price_col = f"back_price_t{args.cutoff_minutes}"
     features["ev"] = features.apply(
         lambda r: compute_expected_value(

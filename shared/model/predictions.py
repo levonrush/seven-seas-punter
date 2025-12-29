@@ -31,6 +31,7 @@ def build_prediction_preview(
     max_edge_multiplier: float = 5.0,
     per_market_limit: int | None = 1,
     commission: float = 0.05,
+    min_prob: float | None = None,
 ) -> pd.DataFrame:
     """Create a human-readable preview of top predictions for sanity checking."""
     if feature_df.empty or probs.empty:
@@ -44,6 +45,10 @@ def build_prediction_preview(
     preview = preview[preview["price"] > 0]
     if preview.empty:
         return pd.DataFrame()
+    if min_prob is not None:
+        preview = preview[preview["p_hat"] >= min_prob]
+        if preview.empty:
+            return pd.DataFrame()
     preview["implied_prob"] = 1.0 / preview["price"]
     preview["expected_value"] = preview.apply(
         lambda r: compute_expected_value(r["p_hat"], r["price"], commission=commission), axis=1

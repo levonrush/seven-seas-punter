@@ -37,6 +37,7 @@ def run_backtest(
     max_spread: float = 1.0,
     max_price: float = DEFAULT_MAX_PRICE,
     max_edge_multiplier: float = DEFAULT_MAX_EDGE_MULTIPLIER,
+    min_prob: float | None = None,
     stake: float = 1.0,
     max_bets_per_day: int | None = None,
     max_exposure_per_race: float | None = None,
@@ -64,6 +65,8 @@ def run_backtest(
             continue
         ev = compute_expected_value(prob, price, commission)
         if ev < min_ev:
+            continue
+        if min_prob is not None and prob < min_prob:
             continue
         implied_prob = 1 / price if price else None
         if implied_prob:

@@ -15,6 +15,7 @@ GRID_PROFILES: Dict[str, Dict[str, List[float]]] = {
         "max_price": [20.0, 50.0, 100.0],
         "max_edge_mult": [3.0, 5.0],
         "max_spread": [0.5, 1.0],
+        "min_prob": [0.0, 0.02, 0.05, 0.1],
     },
     "medium": {
         "min_ev": [0.0, 0.01, 0.02],
@@ -22,6 +23,7 @@ GRID_PROFILES: Dict[str, Dict[str, List[float]]] = {
         "max_price": [10.0, 20.0, 50.0, 100.0],
         "max_edge_mult": [2.0, 3.0, 5.0],
         "max_spread": [0.5, 1.0],
+        "min_prob": [0.0, 0.02, 0.05, 0.1, 0.15],
     },
     "large": {
         "min_ev": [0.0, 0.01, 0.02, 0.05],
@@ -29,16 +31,25 @@ GRID_PROFILES: Dict[str, Dict[str, List[float]]] = {
         "max_price": [10.0, 20.0, 50.0, 100.0, 200.0],
         "max_edge_mult": [2.0, 3.0, 5.0, 10.0],
         "max_spread": [0.2, 0.5, 1.0],
+        "min_prob": [0.0, 0.02, 0.05, 0.1, 0.15, 0.2],
     },
 }
 
 
-def build_strategy_grid(profile: str = "small") -> List[Dict[str, float]]:
+def build_strategy_grid(profile: str = "small", min_prob: float | None = None) -> List[Dict[str, float]]:
     """Return a deterministic grid of strategy parameters for tuning."""
     if profile not in GRID_PROFILES:
         raise ValueError(f"Unknown grid profile: {profile}")
-    grid = GRID_PROFILES[profile]
-    keys = ["min_ev", "min_edge", "max_price", "max_edge_mult", "max_spread"]
+    grid = GRID_PROFILES[profile].copy()
+    if min_prob is not None:
+        candidates = {
+            0.0,
+            max(0.0, min_prob * 0.5),
+            min_prob,
+            min(0.5, min_prob * 1.5),
+        }
+        grid["min_prob"] = sorted(candidates)
+    keys = ["min_ev", "min_edge", "max_price", "max_edge_mult", "max_spread", "min_prob"]
     values = [grid[key] for key in keys]
     return [dict(zip(keys, combo)) for combo in product(*values)]
 
@@ -61,17 +72,19 @@ def tune_strategy(
     min_bets: int = 200,
     stake: float = 1.0,
     log_every: int = 20,
+    min_prob: float | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate a grid of bet filters and return ranked results plus trade-off summary."""
     if feature_df.empty or probs.empty:
         log("Strategy tuning: empty features or probabilities; skipping.")
         return pd.DataFrame(), pd.DataFrame()
 
-    grid = build_strategy_grid(grid_profile)
+    grid = build_strategy_grid(grid_profile, min_prob=min_prob)
     results: List[Dict[str, float]] = []
     total = len(grid)
     log(f"Strategy tuning: evaluating {total} parameter sets (grid={grid_profile}).")
     for idx, params in enumerate(grid, start=1):
+        min_prob_value = params.get("min_prob", min_prob)
         _, metrics = run_backtest(
             feature_df=feature_df,
             probs=probs,
@@ -82,6 +95,7 @@ def tune_strategy(
             max_spread=params["max_spread"],
             max_price=params["max_price"],
             max_edge_multiplier=params["max_edge_mult"],
+            min_prob=min_prob_value,
             stake=stake,
             quiet=True,
         )
@@ -117,7 +131,7 @@ def build_tradeoff_table(
     trade = results_df.copy()
     trade["hit_rate_bin"] = pd.cut(trade["hit_rate"], bins=bins, labels=labels, right=False)
     trade = trade.sort_values(objective, ascending=False)
-    trade = trade.groupby("hit_rate_bin").head(1)
+    trade = trade.groupby("hit_rate_bin", observed=False).head(1)
     columns = [
         "hit_rate_bin",
         "min_ev",
@@ -125,6 +139,7 @@ def build_tradeoff_table(
         "max_price",
         "max_edge_mult",
         "max_spread",
+        "min_prob",
         "bets",
         "hit_rate",
         "roi",

@@ -25,12 +25,38 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     if not archive_path.exists():
         log(f"Ingest: archive not found at {archive_path}; skipping.")
         return
-    if not args.force_ingest and store.has_data("snapshots"):
-        existing = store.table_row_count("snapshots")
+    incremental = getattr(args, "incremental", False)
+    manifest_path = None
+    manifest_candidate = pathlib.Path(getattr(args, "ingest_manifest", "data/ingest_manifest.json"))
+    if incremental or getattr(args, "ingest_manifest", None):
+        manifest_path = manifest_candidate
+    snapshots_exist = store.has_data("snapshots")
+    if snapshots_exist and not args.force_ingest and not incremental and manifest_candidate.exists():
+        incremental = True
+        manifest_path = manifest_candidate
         log(
-            f"Ingest: snapshots already present ({existing} rows); skipping ingest. Use --force-ingest to re-run."
+            "Ingest: manifest found; "
+            f"using incremental ingest ({manifest_candidate})."
         )
-        return
+    if snapshots_exist:
+        existing = store.table_row_count("snapshots")
+        if not args.force_ingest and not incremental:
+            log(
+                "Ingest: snapshots already present "
+                f"({existing} rows); skipping ingest. Use --force-ingest to re-run."
+            )
+            return
+        if incremental:
+            if manifest_path and not manifest_path.exists():
+                log(
+                    "Ingest: incremental manifest missing; "
+                    "this will ingest all members and may duplicate data."
+                )
+            else:
+                log(
+                    "Ingest: snapshots already present "
+                    f"({existing} rows); ingesting only new archive members."
+                )
     counts = ingest_archive_file(
         archive_path,
         store,
@@ -38,6 +64,9 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         progress_every=args.progress_every,
         workers=args.workers,
         filter_au_win=args.filter_au_win,
+        incremental=incremental,
+        manifest_path=manifest_path,
+        force=args.force_ingest,
     )
     log(f"Ingested rows: {counts}")
 
@@ -77,12 +106,76 @@ def _ensure_run_id(args: argparse.Namespace) -> None:
     args.run_id = uuid.uuid4().hex
     log(f"Run id: {args.run_id}")
 
+def _ensure_backtest_run_id(args: argparse.Namespace, store: DuckDBStore) -> None:
+    """Reuse the latest training run id for backtests when one is not provided."""
+    if getattr(args, "run_id", None):
+        return
+    cutoff = getattr(args, "cutoff_minutes", None)
+    with store._connect() as con:  # type: ignore[attr-defined]
+        row = con.execute(
+            """
+            SELECT run_id
+            FROM model_runs
+            WHERE run_id IS NOT NULL AND cutoff_minutes = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [cutoff],
+        ).fetchone()
+    if row and row[0]:
+        args.run_id = row[0]
+        log(f"Backtest: using run id from latest model run ({args.run_id}).")
+
+
+def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | None:
+    """Load the tuned kappa threshold from model runs unless overridden."""
+    if getattr(args, "min_prob", None) is not None:
+        return args.min_prob
+    cutoff = getattr(args, "cutoff_minutes", None)
+    run_id = getattr(args, "run_id", None)
+    with store._connect() as con:  # type: ignore[attr-defined]
+        if run_id:
+            row = con.execute(
+                """
+                SELECT metrics
+                FROM model_runs
+                WHERE run_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [run_id],
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT metrics
+                FROM model_runs
+                WHERE cutoff_minutes = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [cutoff],
+            ).fetchone()
+    if not row:
+        return None
+    metrics = row[0]
+    if isinstance(metrics, str):
+        try:
+            metrics = json.loads(metrics)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(metrics, dict):
+        return metrics.get("kappa_threshold")
+    return None
+
 
 def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None:
     """Set split_date to the last N days of data when requested."""
     if getattr(args, "split_date", None):
         return
     days = getattr(args, "split_days", None)
+    if days is None and getattr(args, "split_last_180", False):
+        days = 180
     if days is None and getattr(args, "split_last_month", False):
         days = 30
     if days is None:
@@ -142,6 +235,14 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
     if getattr(args, "show_preds", True):
+        tuned_min_prob = None
+        if isinstance(metrics, dict):
+            tuned_min_prob = metrics.get("kappa_threshold")
+        preview_min_prob = (
+            args.preds_min_prob if getattr(args, "preds_min_prob", None) is not None else tuned_min_prob
+        )
+        if preview_min_prob is not None:
+            log(f"Prediction preview: using min_prob={preview_min_prob:.3f}.")
         if oof_predictions is not None:
             log("Prediction preview: using out-of-fold predictions from training set.")
             preview_source = train_features
@@ -167,6 +268,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                 max_price=args.preds_max_price,
                 max_edge_multiplier=args.preds_max_edge_mult,
                 per_market_limit=args.preds_per_market,
+                min_prob=preview_min_prob,
             )
             if preview.empty:
                 log("Prediction preview: no rows to show.")
@@ -183,6 +285,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         else:
             tuning_features = train_features.loc[oof_predictions.index]
             commission = getattr(args, "commission", 0.05)
+            strategy_min_prob = getattr(args, "min_prob", None)
+            if strategy_min_prob is None:
+                strategy_min_prob = tuned_min_prob
             results, tradeoff = tune_strategy(
                 feature_df=tuning_features,
                 probs=oof_predictions,
@@ -194,6 +299,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                 min_bets=args.strategy_min_bets,
                 stake=1.0,
                 log_every=args.strategy_log_every,
+                min_prob=strategy_min_prob,
             )
             if results.empty:
                 log("Strategy tuning: no configs met constraints.")
@@ -228,7 +334,9 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest value strategy using trained model (or implied probs fallback)."""
     print(f"Backtesting (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
-    _ensure_run_id(args)
+    _ensure_backtest_run_id(args, store)
+    if not getattr(args, "run_id", None):
+        _ensure_run_id(args)
     _apply_split_from_days(args, store)
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
     if getattr(args, "split_date", None):
@@ -239,6 +347,9 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     if features.empty:
         log("Backtest: no features available after split; skipping.")
         return
+    min_prob = _resolve_min_prob(args, store)
+    if min_prob is not None:
+        log(f"Backtest: using min_prob={min_prob:.3f} from kappa tuning.")
     model_path = getattr(args, "model_path", None) or f"artifacts/model_cutoff_{args.cutoff_minutes}.joblib"
     calibrator_path = getattr(args, "calibrator_path", None) or f"artifacts/calibrator_cutoff_{args.cutoff_minutes}.joblib"
     try:
@@ -258,6 +369,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         max_spread=args.max_spread,
         max_price=args.max_price,
         max_edge_multiplier=args.max_edge_mult,
+        min_prob=min_prob,
         stake=args.stake,
     )
     store.record_bets(bets.to_dict(orient="records"), run_id=getattr(args, "run_id", None))
@@ -314,6 +426,14 @@ def cmd_score(args: argparse.Namespace) -> None:
     from shared.backtest.engine import compute_expected_value
 
     features["p_hat"] = probs
+    min_prob = _resolve_min_prob(args, store)
+    if min_prob is not None:
+        before = len(features)
+        features = features[features["p_hat"] >= min_prob].copy()
+        log(f"Score: applied min_prob={min_prob:.3f} ({len(features)}/{before} rows).")
+        if features.empty:
+            log("No rows remain after min_prob filter.")
+            return
     price_col = f"back_price_t{args.cutoff_minutes}"
     features["ev"] = features.apply(
         lambda r: compute_expected_value(
@@ -422,6 +542,7 @@ def cmd_report(args: argparse.Namespace) -> None:
                 """
             ).fetchone()
 
+    training_metrics = {}
     if model_row:
         created_at, cutoff_minutes, model_path, calibrator_path, metrics, model_run_id = model_row
         if model_run_id:
@@ -431,6 +552,7 @@ def cmd_report(args: argparse.Namespace) -> None:
                 metrics = json.loads(metrics)
             except json.JSONDecodeError:
                 metrics = {"raw": metrics}
+        training_metrics = metrics if isinstance(metrics, dict) else {}
         log(f"Latest model run: {created_at} cutoff=T-{cutoff_minutes}")
         log(f"Model path: {model_path}")
         log(f"Calibrator path: {calibrator_path}")
@@ -450,11 +572,47 @@ def cmd_report(args: argparse.Namespace) -> None:
     else:
         log("No bets found.")
 
+    if model_row:
+        split_date = training_metrics.get("split_date")
+        cv_folds = training_metrics.get("cv_folds")
+        cv_gap = training_metrics.get("cv_gap_days")
+        cv_strategy = training_metrics.get("cv_strategy")
+        train_rows = training_metrics.get("train_rows")
+        train_markets = training_metrics.get("train_markets")
+        calib_rows = training_metrics.get("calib_rows")
+        kappa_threshold = training_metrics.get("kappa_threshold")
+        sample_label = "out-of-sample" if split_date else "in-sample"
+        cv_bits = []
+        if cv_folds:
+            cv_bits.append(f"{cv_folds} folds")
+        if cv_gap is not None:
+            cv_bits.append(f"gap={cv_gap}d")
+        if cv_strategy:
+            cv_bits.append(f"strategy={cv_strategy}")
+        cv_text = ", ".join(cv_bits) if cv_bits else "n/a"
+        threshold_text = (
+            f"{kappa_threshold:.3f}" if isinstance(kappa_threshold, (float, int)) else "n/a"
+        )
+        log("Training vs backtest summary:")
+        log(
+            "Training: "
+            f"rows={train_rows or 'n/a'}, markets={train_markets or 'n/a'}, "
+            f"calib_rows={calib_rows or 'n/a'}, split_date={split_date or 'none'}, "
+            f"cv={cv_text}, kappa_threshold={threshold_text}."
+        )
+        if bet_row and bet_row[0]:
+            log(
+                "Backtest: "
+                f"bets={bets}, roi={roi:.4f}, expected_roi={expected_roi:.4f}, "
+                f"hit_rate={hit_rate:.3f}, sample={sample_label}."
+            )
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
     log("Starting pipeline...")
     _ensure_run_id(args)
+    if getattr(args, "ingest_new", False):
+        args.incremental = True
     if args.archive:
         archive_path = pathlib.Path(args.archive)
         if not archive_path.exists():
@@ -507,6 +665,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--workers", type=int, default=None, help="Parallel workers for stream ingest")
     p_ingest.add_argument("--filter-au-win", action="store_true", help="Only keep AU WIN markets")
     p_ingest.add_argument("--force-ingest", action="store_true", help="Re-ingest even if data exists")
+    p_ingest.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Only ingest new archive members (uses ingest manifest; auto-enabled when manifest exists).",
+    )
+    p_ingest.add_argument(
+        "--ingest-manifest",
+        help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
+    )
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_dl = sub.add_parser("download", help="Download markets/snapshots for a date (or dry-run)")
@@ -569,6 +736,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set split-date to the last 30 days of available data.",
     )
     p_train.add_argument(
+        "--split-last-180",
+        dest="split_days",
+        action="store_const",
+        const=180,
+        help="Set split-date to the last 180 days of available data.",
+    )
+    p_train.add_argument(
         "--split-days",
         type=int,
         help="Set split-date to the last N days of available data.",
@@ -589,6 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
     p_train.add_argument(
         "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+    )
+    p_train.add_argument(
+        "--preds-min-prob",
+        type=float,
+        help="Optional min probability for preview rows (defaults to tuned kappa threshold).",
     )
     p_train.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
     p_train.add_argument(
@@ -665,6 +844,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--max-spread", type=float, default=1.0)
     p_bt.add_argument("--max-price", type=float, default=200.0)
     p_bt.add_argument("--max-edge-mult", type=float, default=5.0)
+    p_bt.add_argument(
+        "--min-prob",
+        type=float,
+        help="Optional min probability to bet (defaults to tuned kappa threshold).",
+    )
     p_bt.add_argument("--stake", type=float, default=1.0)
     p_bt.add_argument("--model-path")
     p_bt.add_argument("--calibrator-path")
@@ -676,6 +860,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-last-month",
         action="store_true",
         help="Set split-date to the last 30 days of available data.",
+    )
+    p_bt.add_argument(
+        "--split-last-180",
+        dest="split_days",
+        action="store_const",
+        const=180,
+        help="Set split-date to the last 180 days of available data.",
     )
     p_bt.add_argument(
         "--split-days",
@@ -696,6 +887,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_score.add_argument("--dry-run", action="store_true")
     p_score.add_argument("--output")
+    p_score.add_argument(
+        "--min-prob",
+        type=float,
+        help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
+    )
     p_score.set_defaults(func=cmd_score)
 
     p_pipe = sub.add_parser("pipeline", help="Run ingest (optional), features, train, backtest, score")
@@ -706,6 +902,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--workers", type=int, default=None, help="Parallel workers for stream ingest")
     p_pipe.add_argument("--filter-au-win", action="store_true", help="Only keep AU WIN markets")
     p_pipe.add_argument("--force-ingest", action="store_true", help="Re-ingest even if data exists")
+    p_pipe.add_argument(
+        "--ingest-new",
+        action="store_true",
+        help="Only ingest new archive members (uses ingest manifest).",
+    )
+    p_pipe.add_argument(
+        "--ingest-manifest",
+        help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
+    )
     p_pipe.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_pipe.add_argument("--commission", type=float, default=0.05)
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
@@ -713,6 +918,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--max-spread", type=float, default=1.0)
     p_pipe.add_argument("--max-price", type=float, default=200.0)
     p_pipe.add_argument("--max-edge-mult", type=float, default=5.0)
+    p_pipe.add_argument(
+        "--min-prob",
+        type=float,
+        help="Optional min probability to bet (defaults to tuned kappa threshold).",
+    )
     p_pipe.add_argument("--stake", type=float, default=1.0)
     p_pipe.add_argument(
         "--split-date",
@@ -722,6 +932,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-last-month",
         action="store_true",
         help="Set split-date to the last 30 days of available data.",
+    )
+    p_pipe.add_argument(
+        "--split-last-180",
+        dest="split_days",
+        action="store_const",
+        const=180,
+        help="Set split-date to the last 180 days of available data.",
     )
     p_pipe.add_argument(
         "--split-days",
@@ -744,6 +961,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
     p_pipe.add_argument(
         "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+    )
+    p_pipe.add_argument(
+        "--preds-min-prob",
+        type=float,
+        help="Optional min probability for preview rows (defaults to tuned kappa threshold).",
     )
     p_pipe.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
     p_pipe.add_argument(

@@ -33,6 +33,10 @@ All notable changes to this project will be documented in this file.
 - Truncated long preview text columns to keep console tables aligned, keeping *_full columns for exports.
 - Added strategy tuning to optimize betting filters for ROI with hit-rate constraints and trade-off summary.
 - Enabled strategy tuning by default with `--no-tune-strategy` to opt out.
+- Added tick-normalized odds/spread features and overround aliases for exchange-style modeling.
+- Strategy tuning now sweeps `min_prob` cutoffs and reports them in the hit-rate trade-off summary.
+- Added market-type model bundles with a global fallback, plus Plackett-Luce normalization for WIN markets.
+- Added liquidity-weighted price features and deltas for exchange-style signals.
 - Added Betfair historic data downloader CLI and API client for automated archive creation.
 - Renamed `.env.example` to `.env.template`, added cert guidance, and ignored common certificate files.
 - Added auto historic download mode with manifest-based resume and force re-download flag.
@@ -49,7 +53,6 @@ All notable changes to this project will be documented in this file.
 - Pipeline now auto-uses `data/data.tar` when present and skips ingest if the archive is missing.
 - Refined README onboarding and added a detailed modeling + leakage safeguards section.
 - Retried historic `list_files` on network/DNS errors and skipped month on failure in auto mode.
-- Defaulted historic download workers to half available cores (capped at 8) when unset.
 - Added retry/backoff for SSO login, configurable via `BETFAIR_SSO_RETRIES` and `BETFAIR_SSO_RETRY_WAIT`.
 - Added run-scoped reporting with `run_id` to align train/backtest metrics.
 - Added `--split-days` for last-N-day splits (plus `--split-last-month` for 30 days).
@@ -58,3 +61,15 @@ All notable changes to this project will be documented in this file.
 - Fixed calibration method error caused by a misplaced indentation.
 - Cached historic `DownloadListOfFiles` responses to avoid repeat API calls (`data/historic_lists/`).
 - Defaulted historic downloads to 1 worker to reduce API throttling.
+- Split the main README and added module-level READMEs for workflow/shared/backtest/model/storage/tests/literature.
+- Added incremental ingest mode with an ingest manifest (`data/ingest_manifest.json`) to skip previously processed archive members.
+- Exposed incremental ingest flags for `punter ingest` and `punter pipeline`, plus manifest path overrides.
+- Documented incremental ingest usage and added ingest manifest to `.gitignore`.
+- Added `--split-last-180` as a shortcut for a 180-day time split.
+- Ingest now auto-switches to incremental mode when snapshots exist and the ingest manifest is present.
+- Stream ingest now skips malformed JSON lines instead of crashing and tracks bad line counts.
+- Ingest seeds a missing manifest when snapshots already exist, skipping full re-ingest to avoid duplicates.
+- Backtests now reuse the latest training run id by default to keep reports aligned.
+- Added a training vs backtest summary block to `punter report`.
+- Expanded feature set with order-book liquidity, spread %, log-odds, volatility, and rank/share deltas.
+- Added kappa-optimized probability cutoff for bet selection (stored in model metrics), replacing class weighting.
