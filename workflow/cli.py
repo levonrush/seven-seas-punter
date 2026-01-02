@@ -27,7 +27,8 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         return
     incremental = getattr(args, "incremental", False)
     manifest_path = None
-    manifest_candidate = pathlib.Path(getattr(args, "ingest_manifest", "data/ingest_manifest.json"))
+    manifest_value = getattr(args, "ingest_manifest", None) or "data/ingest_manifest.json"
+    manifest_candidate = pathlib.Path(manifest_value)
     if incremental or getattr(args, "ingest_manifest", None):
         manifest_path = manifest_candidate
     snapshots_exist = store.has_data("snapshots")
@@ -50,13 +51,15 @@ def cmd_ingest(args: argparse.Namespace) -> None:
             if manifest_path and not manifest_path.exists():
                 log(
                     "Ingest: incremental manifest missing; "
-                    "this will ingest all members and may duplicate data."
+                    "will seed from archive and skip ingest to avoid duplicates."
                 )
             else:
                 log(
                     "Ingest: snapshots already present "
                     f"({existing} rows); ingesting only new archive members."
                 )
+    elif incremental and manifest_path and not manifest_path.exists():
+        log("Ingest: incremental manifest missing; full ingest will create it.")
     counts = ingest_archive_file(
         archive_path,
         store,
@@ -167,6 +170,27 @@ def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | N
     if isinstance(metrics, dict):
         return metrics.get("kappa_threshold")
     return None
+
+
+def _ensure_backtest_run_id(args: argparse.Namespace, store: DuckDBStore) -> None:
+    """Reuse the latest training run id for backtests when one is not provided."""
+    if getattr(args, "run_id", None):
+        return
+    cutoff = getattr(args, "cutoff_minutes", None)
+    with store._connect() as con:  # type: ignore[attr-defined]
+        row = con.execute(
+            """
+            SELECT run_id
+            FROM model_runs
+            WHERE run_id IS NOT NULL AND cutoff_minutes = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [cutoff],
+        ).fetchone()
+    if row and row[0]:
+        args.run_id = row[0]
+        log(f"Backtest: using run id from latest model run ({args.run_id}).")
 
 
 def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None:

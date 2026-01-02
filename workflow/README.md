@@ -52,6 +52,7 @@ punter report --run-id myrun
 ## Ingest behavior
 - Incremental ingest uses `data/ingest_manifest.json` to skip already ingested members.
 - If snapshots already exist and the ingest manifest is present, ingest auto-switches to incremental mode.
+- If snapshots exist but the ingest manifest is missing, ingest seeds the manifest from the archive and skips ingest to avoid duplicates.
 - First incremental run creates the manifest; keep it alongside your DuckDB for repeats.
 - Use `--force-ingest` to reprocess the full archive (may duplicate data).
 

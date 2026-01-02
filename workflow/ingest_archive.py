@@ -44,6 +44,16 @@ def _record_ingested(manifest: Dict, member_name: str) -> None:
     manifest["_members"].add(member_name)
 
 
+def _seed_ingest_manifest(manifest: Dict, member_names: Iterable[str]) -> None:
+    """Seed the ingest manifest with archive members to avoid re-ingesting."""
+    seeded_at = datetime.now(timezone.utc).isoformat()
+    members = manifest.setdefault("members", {})
+    for name in member_names:
+        members[name] = {"ingested_at": seeded_at, "seeded": True}
+    manifest["_members"] = set(members.keys())
+    manifest["seeded_at"] = seeded_at
+
+
 def _load_member_as_df(tar: tarfile.TarFile, member: tarfile.TarInfo) -> pd.DataFrame:
     """Read a tar member into a DataFrame, supporting CSV and Parquet."""
     with tar.extractfile(member) as fh:  # type: ignore[arg-type]
@@ -190,7 +200,7 @@ def _append_snapshots_from_rc(
         )
 
 
-def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str, List[Dict]]:
+def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str, object]:
     """Parse a single .bz2 member from a tar file using byte offsets (worker-safe)."""
     archive_path, offset, size, name, filter_au_win = task
     market_meta: Dict[str, Dict] = {}
@@ -198,6 +208,7 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
     runner_rows: List[Dict] = []
     result_rows: List[Dict] = []
     snapshot_rows: List[Dict] = []
+    bad_lines = 0
 
     with open(archive_path, "rb") as handle:
         handle.seek(offset)
@@ -218,7 +229,11 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
                 line, buffer = buffer.split("\n", 1)
                 if not line.strip():
                     continue
-                msg = json.loads(line)
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_lines += 1
+                    continue
                 pt_ms = msg.get("pt")
                 for mc in msg.get("mc", []):
                     market_id = mc.get("id")
@@ -261,7 +276,7 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
                             continue
                         _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, snapshot_rows)
             except json.JSONDecodeError:
-                pass
+                bad_lines += 1
 
     return {
         "market_rows": market_rows,
@@ -269,6 +284,7 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
         "result_rows": result_rows,
         "snapshot_rows": snapshot_rows,
         "name": name,
+        "bad_lines": bad_lines,
     }
 
 
@@ -285,7 +301,14 @@ def _ingest_bz_stream_archive(
     save_every: int = 100,
 ) -> Dict[str, int]:
     """Parse Betfair historical stream (.bz2 inside tar) and write to DuckDB."""
-    counts = {"snapshots": 0, "markets": 0, "runners": 0, "results": 0, "skipped_markets": 0}
+    counts = {
+        "snapshots": 0,
+        "markets": 0,
+        "runners": 0,
+        "results": 0,
+        "skipped_markets": 0,
+        "bad_lines": 0,
+    }
     market_meta: Dict[str, Dict] = {}
     buffer: List[Dict] = []
     with tarfile.open(archive_path, "r") as tar:
@@ -319,6 +342,7 @@ def _ingest_bz_stream_archive(
                             chunk = snapshot_rows[i : i + flush_every]
                             store.append_snapshots(chunk)
                             counts["snapshots"] += len(chunk)
+                    counts["bad_lines"] += result.get("bad_lines", 0)
                     if manifest is not None:
                         _record_ingested(manifest, result.get("name", ""))
                         if manifest_path and save_every and idx % save_every == 0:
@@ -342,7 +366,11 @@ def _ingest_bz_stream_archive(
                     for line in bz:
                         if not line.strip():
                             continue
-                        msg = json.loads(line)
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            counts["bad_lines"] += 1
+                            continue
                         pt_ms = msg.get("pt")
                         for mc in msg.get("mc", []):
                             market_id = mc.get("id")
@@ -486,13 +514,15 @@ def main() -> None:
             if manifest_path and not manifest_path.exists():
                 log(
                     "Ingest: incremental manifest missing; "
-                    "this will ingest all members and may duplicate data."
+                    "will seed from archive and skip ingest to avoid duplicates."
                 )
             else:
                 log(
                     f"Ingest: snapshots already present ({existing} rows); "
                     "ingesting only new archive members."
                 )
+    elif incremental and manifest_path and not manifest_path.exists():
+        log("Ingest: incremental manifest missing; full ingest will create it.")
 
     counts = ingest_archive_file(
         archive_path,
@@ -521,11 +551,20 @@ def ingest_archive_file(
     force: bool = False,
 ) -> Dict[str, int]:
     """Public helper to ingest a tar archive into DuckDB (stream or tabular)."""
-    counts = {"snapshots": 0, "markets": 0, "runners": 0, "results": 0, "skipped_markets": 0}
+    counts = {
+        "snapshots": 0,
+        "markets": 0,
+        "runners": 0,
+        "results": 0,
+        "skipped_markets": 0,
+        "bad_lines": 0,
+    }
     manifest = None
     member_names: set[str] | None = None
+    manifest_exists = False
     if incremental:
         manifest_path = manifest_path or Path("data/ingest_manifest.json")
+        manifest_exists = manifest_path.exists()
         manifest = _load_ingest_manifest(manifest_path)
     # Detect type by looking for .bz2 members
     with tarfile.open(archive_path, "r") as tar:
@@ -533,6 +572,15 @@ def ingest_archive_file(
         has_bz2 = any(m.name.endswith(".bz2") for m in members)
         if incremental and manifest is not None and not force:
             relevant = [m for m in members if m.name.endswith(".bz2")] if has_bz2 else members
+            if not manifest_exists and store.has_data("snapshots"):
+                _seed_ingest_manifest(manifest, [m.name for m in relevant])
+                if manifest_path:
+                    _save_ingest_manifest(manifest_path, manifest)
+                log(
+                    "Ingest: manifest missing but snapshots exist; "
+                    f"seeded manifest with {len(relevant)} members and skipped ingest to avoid duplicates."
+                )
+                return counts
             new_names = {m.name for m in relevant} - manifest["_members"]
             if not new_names:
                 log("Ingest: no new archive members detected; skipping.")
