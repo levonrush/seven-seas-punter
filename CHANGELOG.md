@@ -73,3 +73,5 @@ All notable changes to this project will be documented in this file.
 - Added a training vs backtest summary block to `punter report`.
 - Expanded feature set with order-book liquidity, spread %, log-odds, volatility, and rank/share deltas.
 - Added kappa-optimized probability cutoff for bet selection (stored in model metrics), replacing class weighting.
+- Fixed market-type OOF metric evaluation to align by index and avoid pandas assertion errors.
+- Stream ingest now skips corrupted `.bz2` members (invalid data stream) and tracks them as bad files instead of crashing.

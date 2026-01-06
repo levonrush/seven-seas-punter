@@ -209,74 +209,88 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
     result_rows: List[Dict] = []
     snapshot_rows: List[Dict] = []
     bad_lines = 0
+    bad_files = 0
+    error_message: str | None = None
 
-    with open(archive_path, "rb") as handle:
-        handle.seek(offset)
-        remaining = size
-        decompressor = bz2.BZ2Decompressor()
-        buffer = ""
-        while remaining > 0:
-            chunk = handle.read(min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            data = decompressor.decompress(chunk)
-            if not data:
-                continue
-            text = data.decode("utf-8", errors="ignore")
-            buffer += text
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                if not line.strip():
+    try:
+        with open(archive_path, "rb") as handle:
+            handle.seek(offset)
+            remaining = size
+            decompressor = bz2.BZ2Decompressor()
+            buffer = ""
+            while remaining > 0:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                data = decompressor.decompress(chunk)
+                if not data:
                     continue
+                text = data.decode("utf-8", errors="ignore")
+                buffer += text
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        bad_lines += 1
+                        continue
+                    pt_ms = msg.get("pt")
+                    for mc in msg.get("mc", []):
+                        market_id = mc.get("id")
+                        if not market_id:
+                            continue
+                        if "marketDefinition" in mc:
+                            market_row, runners, results, meta = _market_definition_to_rows(
+                                market_id, mc["marketDefinition"], filter_au_win
+                            )
+                            if market_row:
+                                market_rows.append(market_row)
+                                runner_rows.extend(runners)
+                                result_rows.extend(results)
+                            market_meta[market_id] = meta
+                        if "rc" in mc:
+                            meta = market_meta.get(market_id, {})
+                            if not meta.get("eligible"):
+                                continue
+                            _append_snapshots_from_rc(
+                                market_id, mc["rc"], pt_ms, meta, snapshot_rows
+                            )
+            if buffer.strip():
                 try:
-                    msg = json.loads(line)
+                    msg = json.loads(buffer)
+                    pt_ms = msg.get("pt")
+                    for mc in msg.get("mc", []):
+                        market_id = mc.get("id")
+                        if not market_id:
+                            continue
+                        if "marketDefinition" in mc:
+                            market_row, runners, results, meta = _market_definition_to_rows(
+                                market_id, mc["marketDefinition"], filter_au_win
+                            )
+                            if market_row:
+                                market_rows.append(market_row)
+                                runner_rows.extend(runners)
+                                result_rows.extend(results)
+                            market_meta[market_id] = meta
+                        if "rc" in mc:
+                            meta = market_meta.get(market_id, {})
+                            if not meta.get("eligible"):
+                                continue
+                            _append_snapshots_from_rc(
+                                market_id, mc["rc"], pt_ms, meta, snapshot_rows
+                            )
                 except json.JSONDecodeError:
                     bad_lines += 1
-                    continue
-                pt_ms = msg.get("pt")
-                for mc in msg.get("mc", []):
-                    market_id = mc.get("id")
-                    if not market_id:
-                        continue
-                    if "marketDefinition" in mc:
-                        market_row, runners, results, meta = _market_definition_to_rows(
-                            market_id, mc["marketDefinition"], filter_au_win
-                        )
-                        if market_row:
-                            market_rows.append(market_row)
-                            runner_rows.extend(runners)
-                            result_rows.extend(results)
-                        market_meta[market_id] = meta
-                    if "rc" in mc:
-                        meta = market_meta.get(market_id, {})
-                        if not meta.get("eligible"):
-                            continue
-                        _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, snapshot_rows)
-        if buffer.strip():
-            try:
-                msg = json.loads(buffer)
-                pt_ms = msg.get("pt")
-                for mc in msg.get("mc", []):
-                    market_id = mc.get("id")
-                    if not market_id:
-                        continue
-                    if "marketDefinition" in mc:
-                        market_row, runners, results, meta = _market_definition_to_rows(
-                            market_id, mc["marketDefinition"], filter_au_win
-                        )
-                        if market_row:
-                            market_rows.append(market_row)
-                            runner_rows.extend(runners)
-                            result_rows.extend(results)
-                        market_meta[market_id] = meta
-                    if "rc" in mc:
-                        meta = market_meta.get(market_id, {})
-                        if not meta.get("eligible"):
-                            continue
-                        _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, snapshot_rows)
-            except json.JSONDecodeError:
-                bad_lines += 1
+    except OSError as exc:
+        bad_files = 1
+        error_message = str(exc)
+        market_rows = []
+        runner_rows = []
+        result_rows = []
+        snapshot_rows = []
 
     return {
         "market_rows": market_rows,
@@ -285,6 +299,8 @@ def _parse_member_from_offset(task: tuple[str, int, int, str, bool]) -> Dict[str
         "snapshot_rows": snapshot_rows,
         "name": name,
         "bad_lines": bad_lines,
+        "bad_files": bad_files,
+        "error": error_message,
     }
 
 
@@ -308,6 +324,7 @@ def _ingest_bz_stream_archive(
         "results": 0,
         "skipped_markets": 0,
         "bad_lines": 0,
+        "bad_files": 0,
     }
     market_meta: Dict[str, Dict] = {}
     buffer: List[Dict] = []
@@ -343,6 +360,12 @@ def _ingest_bz_stream_archive(
                             store.append_snapshots(chunk)
                             counts["snapshots"] += len(chunk)
                     counts["bad_lines"] += result.get("bad_lines", 0)
+                    counts["bad_files"] += result.get("bad_files", 0)
+                    if result.get("error"):
+                        log(
+                            "Ingest: failed to decompress "
+                            f"{result.get('name', 'unknown')} ({result.get('error')})."
+                        )
                     if manifest is not None:
                         _record_ingested(manifest, result.get("name", ""))
                         if manifest_path and save_every and idx % save_every == 0:
@@ -362,42 +385,52 @@ def _ingest_bz_stream_archive(
             with tar.extractfile(member) as fh:  # type: ignore[arg-type]
                 if fh is None:
                     continue
-                with bz2.open(fh, "rt") as bz:
-                    for line in bz:
-                        if not line.strip():
-                            continue
-                        try:
-                            msg = json.loads(line)
-                        except json.JSONDecodeError:
-                            counts["bad_lines"] += 1
-                            continue
-                        pt_ms = msg.get("pt")
-                        for mc in msg.get("mc", []):
-                            market_id = mc.get("id")
-                            if not market_id:
+                try:
+                    with bz2.open(fh, "rt") as bz:
+                        for line in bz:
+                            if not line.strip():
                                 continue
-                            if "marketDefinition" in mc:
-                                meta = _handle_market_definition(
-                                    market_id, mc["marketDefinition"], store, filter_au_win
-                                )
-                                market_meta[market_id] = meta
-                                if meta.get("eligible"):
-                                    counts["markets"] += 1
-                                    counts["runners"] += len(mc["marketDefinition"].get("runners", []))
-                                    if mc["marketDefinition"].get("status") == "CLOSED":
-                                        counts["results"] += len(mc["marketDefinition"].get("runners", []))
-                                else:
-                                    counts["skipped_markets"] += 1
-                            if "rc" in mc:
-                                meta = market_meta.get(market_id, {})
-                                if filter_au_win and not meta.get("eligible"):
+                            try:
+                                msg = json.loads(line)
+                            except json.JSONDecodeError:
+                                counts["bad_lines"] += 1
+                                continue
+                            pt_ms = msg.get("pt")
+                            for mc in msg.get("mc", []):
+                                market_id = mc.get("id")
+                                if not market_id:
                                     continue
-                                _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, buffer)
-                                if len(buffer) >= flush_every:
-                                    store.append_snapshots(buffer)
-                                    counts["snapshots"] += len(buffer)
-                                    log(f"Flushed {len(buffer)} snapshots (total {counts['snapshots']}).")
-                                    buffer = []
+                                if "marketDefinition" in mc:
+                                    meta = _handle_market_definition(
+                                        market_id, mc["marketDefinition"], store, filter_au_win
+                                    )
+                                    market_meta[market_id] = meta
+                                    if meta.get("eligible"):
+                                        counts["markets"] += 1
+                                        counts["runners"] += len(
+                                            mc["marketDefinition"].get("runners", [])
+                                        )
+                                        if mc["marketDefinition"].get("status") == "CLOSED":
+                                            counts["results"] += len(
+                                                mc["marketDefinition"].get("runners", [])
+                                            )
+                                    else:
+                                        counts["skipped_markets"] += 1
+                                if "rc" in mc:
+                                    meta = market_meta.get(market_id, {})
+                                    if filter_au_win and not meta.get("eligible"):
+                                        continue
+                                    _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, buffer)
+                                    if len(buffer) >= flush_every:
+                                        store.append_snapshots(buffer)
+                                        counts["snapshots"] += len(buffer)
+                                        log(
+                                            f"Flushed {len(buffer)} snapshots (total {counts['snapshots']})."
+                                        )
+                                        buffer = []
+                except OSError as exc:
+                    counts["bad_files"] += 1
+                    log(f"Ingest: failed to decompress {member.name} ({exc}).")
             if manifest is not None:
                 _record_ingested(manifest, member.name)
                 if manifest_path and save_every and idx % save_every == 0:

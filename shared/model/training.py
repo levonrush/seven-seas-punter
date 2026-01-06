@@ -462,16 +462,16 @@ def _train_market_type_models(
 
     oof_predictions = oof_predictions.dropna()
     metrics: Dict[str, float] = {}
-    eval_mask = oof_predictions.notna()
-    if eval_mask.any():
-        eval_y = df.loc[eval_mask, "win_target"].astype(int)
-        eval_probs = oof_predictions.loc[eval_mask]
+    if not oof_predictions.empty:
+        eval_index = oof_predictions.index.intersection(df.index)
+        eval_probs = oof_predictions.loc[eval_index]
+        eval_y = df.loc[eval_index, "win_target"].astype(int)
         metrics = {
             "log_loss": float(log_loss(eval_y, eval_probs)),
             "brier": float(brier_score_loss(eval_y, eval_probs)),
             "train_rows": int(len(df)),
             "train_markets": int(df["market_id"].nunique()) if "market_id" in df.columns else None,
-            "calib_rows": int(eval_mask.sum()),
+            "calib_rows": int(len(eval_index)),
         }
         kappa_threshold, kappa_score = _find_best_kappa_threshold(
             np.asarray(eval_probs), eval_y
