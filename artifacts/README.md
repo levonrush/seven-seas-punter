@@ -6,6 +6,7 @@ It is safe to delete and re-create at any time.
 Typical contents:
 - `model_cutoff_*.joblib`: trained LightGBM model bundles.
 - `calibrator_cutoff_*.joblib`: probability calibrators.
+- `calibration_cutoff_*_run_*.csv`: reliability bins and ECE for out-of-fold calibration checks.
 - `pipeline_score_cutoff_*.csv`: scored opportunities from `punter pipeline` or `punter score-today`.
 - `strategy_tuning_cutoff_*.csv`: grid search results for strategy params.
 - `strategy_best_cutoff_*.json`: best strategy params chosen by the tuner.

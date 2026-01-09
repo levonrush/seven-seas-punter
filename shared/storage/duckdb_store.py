@@ -245,6 +245,51 @@ class DuckDBStore:
                 [model_path, calibrator_path, cutoff_minutes, metrics or {}, notes, run_id],
             )
 
+    def record_oof_predictions(
+        self,
+        predictions: Iterable[Dict[str, Any]],
+        run_id: str,
+        cutoff_minutes: int,
+    ) -> None:
+        """Persist out-of-fold predictions so backtests can avoid in-sample bias."""
+        df = pd.DataFrame(list(predictions))
+        if df.empty:
+            return
+        df["run_id"] = run_id
+        df["cutoff_minutes"] = cutoff_minutes
+        cols = ["run_id", "cutoff_minutes", "market_id", "selection_id", "p_hat"]
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        df = df[cols]
+        df = df.dropna(subset=["market_id", "selection_id", "p_hat"])
+        if df.empty:
+            return
+        with self._connect() as con:
+            con.execute(
+                "DELETE FROM oof_predictions WHERE run_id = ? AND cutoff_minutes = ?",
+                [run_id, cutoff_minutes],
+            )
+            con.register("df", df)
+            con.execute(
+                """
+                INSERT INTO oof_predictions (run_id, cutoff_minutes, market_id, selection_id, p_hat)
+                SELECT run_id, cutoff_minutes, market_id, selection_id, p_hat FROM df
+                """
+            )
+
+    def load_oof_predictions(self, run_id: str, cutoff_minutes: int) -> pd.DataFrame:
+        """Load stored out-of-fold predictions for a specific training run."""
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT market_id, selection_id, p_hat
+                FROM oof_predictions
+                WHERE run_id = ? AND cutoff_minutes = ?
+                """,
+                [run_id, cutoff_minutes],
+            ).df()
+
     def load_snapshots(self) -> pd.DataFrame:
         """Return all stored snapshots for downstream feature construction."""
         with self._connect() as con:

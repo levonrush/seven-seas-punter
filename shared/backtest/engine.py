@@ -50,6 +50,15 @@ def run_backtest(
         return pd.DataFrame(), {}
 
     df = feature_df.copy()
+    if "win_target" in df.columns:
+        missing_results = df["win_target"].isna().sum()
+        if missing_results and not quiet:
+            log(f"Backtest: skipping {missing_results} rows without results.")
+        df = df[df["win_target"].notna()].copy()
+    if df.empty:
+        if not quiet:
+            log("Backtest: no labeled rows available after filtering; skipping.")
+        return pd.DataFrame(), {}
     df["p_hat"] = probs
     price_col = f"back_price_t{cutoff_minutes}"
     spread_col = f"spread_t{cutoff_minutes}"
@@ -129,6 +138,9 @@ def run_backtest(
     hit_rate = wins / len(bet_df) if len(bet_df) else 0
     roi = profit / stake_sum if stake_sum else 0
     expected_roi = expected_profit / stake_sum if stake_sum else 0
+    avg_pred = float(bet_df["prob"].mean()) if "prob" in bet_df else 0.0
+    avg_win_rate = float(bet_df["win_flag"].mean()) if "win_flag" in bet_df else 0.0
+    prob_gap = avg_pred - avg_win_rate
 
     # Drawdown
     bet_df = bet_df.sort_values(["race_start_time", "market_id", "selection_id"])
@@ -157,6 +169,9 @@ def run_backtest(
         "roi": float(roi),
         "expected_roi": float(expected_roi),
         "hit_rate": float(hit_rate),
+        "avg_pred": float(avg_pred),
+        "avg_win_rate": float(avg_win_rate),
+        "prob_gap": float(prob_gap),
         "max_drawdown": float(max_drawdown),
         "avg_price_improvement": float(price_improvement) if price_improvement is not None else None,
     }

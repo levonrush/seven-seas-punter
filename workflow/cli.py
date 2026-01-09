@@ -11,6 +11,7 @@ from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.predictions import build_prediction_preview
+from shared.model.market_type import bucket_market_type
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
@@ -193,6 +194,45 @@ def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None
     log(f"Split date set to {split_date} ({label}).")
 
 
+def _filter_to_win_markets(feature_df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Filter to WIN markets so win-target evaluation remains consistent."""
+    if feature_df.empty or "market_type" not in feature_df.columns:
+        return feature_df
+    buckets = feature_df["market_type"].apply(bucket_market_type)
+    win_mask = buckets == "WIN"
+    if win_mask.any():
+        filtered = feature_df.loc[win_mask].copy()
+        log(f"{label}: filtered to WIN markets ({len(filtered)}/{len(feature_df)} rows).")
+        return filtered
+    log(f"{label}: no WIN markets found; keeping all rows.")
+    return feature_df
+
+
+def _load_oof_predictions_for_backtest(
+    store: DuckDBStore,
+    feature_df: pd.DataFrame,
+    run_id: str,
+    cutoff_minutes: int,
+) -> tuple[pd.DataFrame, pd.Series] | tuple[None, None]:
+    """Fetch stored out-of-fold predictions to avoid in-sample backtest bias."""
+    oof = store.load_oof_predictions(run_id, cutoff_minutes)
+    if oof.empty:
+        return None, None
+    oof = oof.drop_duplicates(subset=["market_id", "selection_id"], keep="last")
+    merged = feature_df.merge(oof, on=["market_id", "selection_id"], how="left")
+    missing = merged["p_hat"].isna().sum()
+    if missing == len(merged):
+        return None, None
+    if missing:
+        log(
+            f"Backtest: {missing}/{len(merged)} rows missing OOF predictions; dropping them."
+        )
+    merged = merged.dropna(subset=["p_hat"])
+    probs = merged["p_hat"].copy()
+    features = merged.drop(columns=["p_hat"])
+    return features, probs
+
+
 def cmd_features(args: argparse.Namespace) -> None:
     """Build features at a cutoff minute and save Parquet."""
     print(f"Building features (cutoff T-{args.cutoff_minutes})...")
@@ -223,6 +263,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         log(f"Training: split-date {args.split_date} -> {len(train_features)} train rows.")
     else:
         log("Training: no split-date set; training on full dataset (in-sample).")
+    train_features = _filter_to_win_markets(train_features, "Training")
+    if test_features is not None:
+        test_features = _filter_to_win_markets(test_features, "Holdout")
     if train_features.empty:
         log("Training: no features available after split; skipping.")
         return
@@ -344,6 +387,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         log(f"Backtest: split-date {args.split_date} -> {len(features)} rows.")
     else:
         log("Backtest: no split-date set; backtest is in-sample.")
+    features = _filter_to_win_markets(features, "Backtest")
     if features.empty:
         log("Backtest: no features available after split; skipping.")
         return
@@ -352,13 +396,23 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         log(f"Backtest: using min_prob={min_prob:.3f} from kappa tuning.")
     model_path = getattr(args, "model_path", None) or f"artifacts/model_cutoff_{args.cutoff_minutes}.joblib"
     calibrator_path = getattr(args, "calibrator_path", None) or f"artifacts/calibrator_cutoff_{args.cutoff_minutes}.joblib"
-    try:
-        model, calibrator = load_model_and_calibrator(model_path, calibrator_path)
-        probs = predict_probabilities(model, calibrator, features)
-    except FileNotFoundError:
-        price_col = f"back_price_t{args.cutoff_minutes}"
-        implied = 1 / features[price_col]
-        probs = implied.fillna(implied.mean())
+    probs = None
+    if not getattr(args, "split_date", None) and getattr(args, "run_id", None):
+        features_oof, probs_oof = _load_oof_predictions_for_backtest(
+            store, features, args.run_id, args.cutoff_minutes
+        )
+        if probs_oof is not None:
+            log("Backtest: using out-of-fold predictions from stored training run.")
+            features = features_oof
+            probs = probs_oof
+    if probs is None:
+        try:
+            model, calibrator = load_model_and_calibrator(model_path, calibrator_path)
+            probs = predict_probabilities(model, calibrator, features)
+        except FileNotFoundError:
+            price_col = f"back_price_t{args.cutoff_minutes}"
+            implied = 1 / features[price_col]
+            probs = implied.fillna(implied.mean())
     bets, metrics = run_backtest(
         feature_df=features,
         probs=probs,
@@ -409,6 +463,7 @@ def cmd_score(args: argparse.Namespace) -> None:
     store.append_snapshots(snapshots)
 
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    features = _filter_to_win_markets(features, "Score")
     if features.empty:
         log("No features available for scoring.")
         return

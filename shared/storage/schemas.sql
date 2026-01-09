@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS model_runs (
     metrics JSON
 );
 
+CREATE TABLE IF NOT EXISTS oof_predictions (
+    created_at TIMESTAMP DEFAULT now(),
+    run_id TEXT,
+    cutoff_minutes INTEGER,
+    market_id TEXT,
+    selection_id BIGINT,
+    p_hat DOUBLE
+);
+
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS market_type TEXT;
 ALTER TABLE bets ADD COLUMN IF NOT EXISTS run_id TEXT;
 ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS run_id TEXT;

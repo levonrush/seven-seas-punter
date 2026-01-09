@@ -6,6 +6,8 @@ The backtest engine simulates a simple value strategy using model probabilities.
 - Compute expected value: `p_hat * (price - 1) * (1 - commission) - (1 - p_hat)`.
 - Filter by minimum EV, edge, spread, max price, edge multiplier, and optional `min_prob`.
 - Apply optional risk controls (max bets per day, max exposure per race).
+- The CLI prefers out-of-fold predictions for in-sample backtests to reduce optimism bias.
+- When `market_type` is present, the CLI filters to WIN markets to keep targets consistent.
 
 If `min_prob` is unset, the CLI will use the tuned `kappa_threshold` from the latest model run.
 

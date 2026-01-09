@@ -75,3 +75,9 @@ All notable changes to this project will be documented in this file.
 - Added kappa-optimized probability cutoff for bet selection (stored in model metrics), replacing class weighting.
 - Fixed market-type OOF metric evaluation to align by index and avoid pandas assertion errors.
 - Stream ingest now skips corrupted `.bz2` members (invalid data stream) and tracks them as bad files instead of crashing.
+- Persisted training feature columns and aligned prediction inputs to avoid LightGBM feature-count mismatches.
+- Added calibration reliability reports (ECE + bins) and saved them to `artifacts/` per run.
+- Stored out-of-fold predictions in DuckDB and use them for in-sample backtests to reduce optimism bias.
+- Backtests now filter to WIN markets when market_type is available to keep targets consistent.
+- Backtest metrics now include average predicted win rate and the prediction gap versus actuals.
+- Added AGENTS.md with repository guidance for automated agents.

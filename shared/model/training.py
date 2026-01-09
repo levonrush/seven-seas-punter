@@ -71,6 +71,30 @@ def _feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in drop_cols and df[c].dtype != "object"]
 
 
+def _align_feature_frame(feature_df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+    """Align a feature frame to the exact training columns, adding missing columns as zeros."""
+    if feature_df.empty:
+        return feature_df
+    aligned = feature_df.copy()
+    missing = [col for col in feature_columns if col not in aligned.columns]
+    for col in missing:
+        aligned[col] = 0.0
+    extra = [col for col in aligned.columns if col not in feature_columns]
+    if extra:
+        aligned = aligned.drop(columns=extra)
+    return aligned[feature_columns].fillna(0.0)
+
+
+def _log_feature_alignment(feature_df: pd.DataFrame, feature_columns: list[str], label: str) -> None:
+    """Log feature alignment details when training/prediction columns differ."""
+    missing = [col for col in feature_columns if col not in feature_df.columns]
+    extra = [col for col in feature_df.columns if col not in feature_columns]
+    if missing or extra:
+        log(
+            f"{label}: aligning features (missing={len(missing)}, extra={len(extra)})."
+        )
+
+
 def _bucket_market_series(df: pd.DataFrame) -> pd.Series:
     """Return a bucket label per row to route market-type specific models."""
     if "market_type" not in df.columns:
@@ -174,6 +198,30 @@ def _find_best_kappa_threshold(
             best_kappa = float(kappa)
             best_threshold = float(threshold)
     return best_threshold, best_kappa
+
+
+def _build_calibration_report(
+    probs: pd.Series, y: pd.Series, bins: int = 10
+) -> tuple[pd.DataFrame, Optional[float]]:
+    """Summarize probability calibration so ROI gaps can be diagnosed."""
+    frame = pd.DataFrame({"p_hat": probs, "win_target": y}).dropna()
+    if frame.empty:
+        return pd.DataFrame(), None
+    try:
+        frame["bin"] = pd.qcut(frame["p_hat"], q=bins, duplicates="drop")
+    except ValueError:
+        frame["bin"] = pd.cut(frame["p_hat"], bins=bins)
+    grouped = frame.groupby("bin", observed=False)
+    report = grouped.agg(
+        count=("p_hat", "size"),
+        mean_pred=("p_hat", "mean"),
+        win_rate=("win_target", "mean"),
+    )
+    report["abs_error"] = (report["mean_pred"] - report["win_rate"]).abs()
+    total = report["count"].sum()
+    report["weight"] = report["count"] / total if total else 0.0
+    ece = float((report["abs_error"] * report["weight"]).sum()) if total else None
+    return report.reset_index(), ece
 
 
 def _build_model_from_params(best_params: Optional[dict]):
@@ -295,13 +343,15 @@ def _train_single_model(
     cv_gap_days: int,
     cv_strategy: str,
     label: str,
+    feature_columns: Optional[list[str]] = None,
 ) -> tuple[Optional[object], Optional[object], Dict[str, float], Optional[pd.Series]]:
     """Train one LightGBM model + calibrator for a specific data subset."""
     if df.empty:
         log(f"Training{label}: no labeled rows; skipping.")
         return None, None, {}, None
 
-    X = df[_feature_columns(df)].fillna(0.0)
+    feature_columns = feature_columns or _feature_columns(df)
+    X = _align_feature_frame(df, feature_columns)
     y = df["win_target"].astype(int)
     groups = df["market_id"] if "market_id" in df.columns else None
     log(f"Training{label}: {len(df)} rows, {X.shape[1]} features, cutoff T-{cutoff_minutes}.")
@@ -404,6 +454,7 @@ def _train_market_type_models(
 ) -> tuple[dict, dict, Dict[str, float], pd.Series]:
     """Train per-market-type models with a global fallback and return combined metrics."""
     df = df.copy()
+    feature_columns = _feature_columns(df)
     df["market_type_bucket"] = _bucket_market_series(df)
     buckets = df["market_type_bucket"].value_counts()
     eligible = {bucket for bucket, count in buckets.items() if count >= min_rows}
@@ -426,6 +477,7 @@ def _train_market_type_models(
             cv_gap_days=cv_gap_days,
             cv_strategy=cv_strategy,
             label=label,
+            feature_columns=feature_columns,
         )
         if model is None:
             continue
@@ -448,6 +500,7 @@ def _train_market_type_models(
             cv_gap_days=cv_gap_days,
             cv_strategy=cv_strategy,
             label="[ALL]",
+            feature_columns=feature_columns,
         )
         if fallback_oof is not None:
             oof_predictions = oof_predictions.fillna(fallback_oof)
@@ -484,7 +537,7 @@ def _train_market_type_models(
     metrics["market_type_fallback"] = fallback_metrics
     metrics["market_type_min_rows"] = int(min_rows)
 
-    model_bundle = {"models": models, "fallback": fallback_model}
+    model_bundle = {"models": models, "fallback": fallback_model, "feature_columns": feature_columns}
     calibrator_bundle = {"calibrators": calibrators, "fallback": fallback_calibrator}
     return model_bundle, calibrator_bundle, metrics, oof_predictions
 
@@ -558,6 +611,7 @@ def train_and_calibrate(
 
     _require_lightgbm()
     use_market_type_models = "market_type" in df.columns
+    feature_columns = _feature_columns(df)
     if use_market_type_models:
         log("Training: market_type column found; using market-type specific models.")
         model_obj, calibrator_obj, metrics, oof_predictions = _train_market_type_models(
@@ -579,7 +633,17 @@ def train_and_calibrate(
             cv_gap_days=cv_gap_days,
             cv_strategy=cv_strategy,
             label="",
+            feature_columns=feature_columns,
         )
+
+    metrics["feature_columns"] = feature_columns
+    if isinstance(model_obj, dict) and "models" in model_obj:
+        model_obj["feature_columns"] = feature_columns
+    else:
+        model_obj = {
+            "model": model_obj,
+            "feature_columns": feature_columns,
+        }
 
     metrics["cutoff_minutes"] = float(cutoff_minutes)
     metrics["split_date"] = split_date
@@ -595,6 +659,19 @@ def train_and_calibrate(
     joblib.dump(calibrator_obj, calibrator_path)
     log(f"Training: saved model to {model_path}")
     log(f"Training: saved calibrator to {calibrator_path}")
+
+    if oof_predictions is not None and not oof_predictions.empty:
+        eval_index = oof_predictions.index.intersection(df.index)
+        eval_probs = oof_predictions.loc[eval_index]
+        eval_y = df.loc[eval_index, "win_target"].astype(int)
+        report, ece = _build_calibration_report(eval_probs, eval_y)
+        if ece is not None:
+            metrics["calibration_ece"] = float(ece)
+        if not report.empty:
+            suffix = f"_run_{run_id}" if run_id else ""
+            report_path = artifacts_path / f"calibration_cutoff_{cutoff_minutes}{suffix}.csv"
+            report.to_csv(report_path, index=False)
+            log(f"Training: wrote calibration report to {report_path}")
 
     if store:
         model_label = metrics.get("model_label", "LightGBM")
@@ -614,6 +691,16 @@ def train_and_calibrate(
             notes=f"{model_label} + {calibration_note} calibration",
             run_id=run_id,
         )
+        if run_id and oof_predictions is not None and not oof_predictions.empty:
+            oof_frame = df.loc[oof_predictions.index, ["market_id", "selection_id"]].copy()
+            oof_frame["p_hat"] = oof_predictions.values
+            store.record_oof_predictions(
+                oof_frame.to_dict(orient="records"),
+                run_id=run_id,
+                cutoff_minutes=cutoff_minutes,
+            )
+        elif oof_predictions is not None and not oof_predictions.empty:
+            log("Training: run_id missing; skipping OOF prediction storage.")
 
     return str(model_path), str(calibrator_path), metrics, oof_predictions
 
@@ -637,6 +724,9 @@ def _predict_probabilities_by_market_type(
     bucket_series = _bucket_market_series(feature_df)
     model_map = model_bundle.get("models", {})
     fallback_model = model_bundle.get("fallback") or next(iter(model_map.values()), None)
+    feature_columns = model_bundle.get("feature_columns")
+    if feature_columns is None and hasattr(fallback_model, "feature_name_"):
+        feature_columns = list(getattr(fallback_model, "feature_name_", []))
     if fallback_model is None:
         return pd.Series(dtype=float)
 
@@ -649,10 +739,15 @@ def _predict_probabilities_by_market_type(
         fallback_calibrator = calibrator_bundle
 
     probs = pd.Series(index=feature_df.index, dtype=float)
+    if feature_columns:
+        _log_feature_alignment(feature_df, feature_columns, "Predict")
     for bucket, indices in bucket_series.groupby(bucket_series).groups.items():
         model = model_map.get(bucket, fallback_model)
         calibrator = calibrator_map.get(bucket, fallback_calibrator)
-        X = feature_df.loc[indices, _feature_columns(feature_df)].fillna(0.0)
+        if feature_columns:
+            X = _align_feature_frame(feature_df.loc[indices], feature_columns)
+        else:
+            X = feature_df.loc[indices, _feature_columns(feature_df)].fillna(0.0)
         probs.loc[indices] = _predict_with_model(model, calibrator, X)
 
     if apply_plackett_luce and "market_id" in feature_df.columns:
@@ -675,7 +770,17 @@ def predict_probabilities(
             model, calibrator, feature_df, apply_plackett_luce=apply_plackett_luce
         )
 
-    X = feature_df[_feature_columns(feature_df)].fillna(0.0)
+    feature_columns = None
+    if isinstance(model, dict) and "model" in model:
+        feature_columns = model.get("feature_columns")
+        model = model.get("model")
+    if feature_columns is None and hasattr(model, "feature_name_"):
+        feature_columns = list(getattr(model, "feature_name_", []))
+    if feature_columns:
+        _log_feature_alignment(feature_df, feature_columns, "Predict")
+        X = _align_feature_frame(feature_df, feature_columns)
+    else:
+        X = feature_df[_feature_columns(feature_df)].fillna(0.0)
     probs = _predict_with_model(model, calibrator, X)
     probs = pd.Series(probs, index=feature_df.index)
     if apply_plackett_luce and "market_id" in feature_df.columns:
