@@ -316,8 +316,11 @@ class DuckDBStore:
             return con.execute("SELECT * FROM runners").df()
 
     def max_race_start_time(self) -> Optional[pd.Timestamp]:
-        """Return the latest race_start_time available in markets."""
+        """Return the latest race_start_time from snapshots, falling back to markets."""
         with self._connect() as con:
+            result = con.execute("SELECT MAX(race_start_time) FROM snapshots").fetchone()
+            if result and result[0]:
+                return result[0]
             result = con.execute("SELECT MAX(race_start_time) FROM markets").fetchone()
         if not result:
             return None

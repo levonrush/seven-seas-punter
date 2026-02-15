@@ -9,6 +9,7 @@ Required for historic downloads:
 - `BETFAIR_PASSWORD`
 
 Optional (AU accounts can run without certs):
+- `BETFAIR_CERT_PATH` (directory containing `client-2048.crt` + `client-2048.key`)
 - `BETFAIR_CERT_FILE`
 - `BETFAIR_KEY_FILE`
 

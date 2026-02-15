@@ -51,6 +51,38 @@ punter ingest --incremental
 punter pipeline --cutoff-minutes 10 --ingest-new
 ```
 
+## Live betting (polling)
+Live execution reuses the trained model artefacts and runs directly from the unified CLI.
+
+Environment variables (required for live mode):
+- `BETFAIR_APP_KEY`
+- `BETFAIR_USERNAME`
+- `BETFAIR_PASSWORD`
+- Optional cert auth:
+  - `BETFAIR_CERT_PATH` (directory containing `client-2048.crt` and `client-2048.key`)
+  - or `BETFAIR_CERT_FILE` + `BETFAIR_KEY_FILE`
+
+Use the example config:
+```bash
+cp docs/live_betfair_config.example.yaml config.yaml
+punter live --config config.yaml --once
+```
+
+Dry-run is `true` by default in the example config and logs simulated orders to `artifacts/live_decisions.csv`.
+Set `dry_run: false` only after stake caps are reviewed and credentials are confirmed.
+
+Useful CLI options:
+```bash
+# write a starter config
+punter live --write-config config/live.yaml
+
+# run continuously in dry-run mode
+punter live --config config/live.yaml --dry-run
+
+# run live with explicit safety overrides
+punter live --config config/live.yaml --live --max-stake-per-market 5 --max-daily-exposure 50
+```
+
 ## Where to look next
 - Workflow usage and CLI examples: `workflow/README.md`
 - Modeling details and leakage safeguards: `shared/model/README.md`

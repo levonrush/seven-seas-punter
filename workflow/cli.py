@@ -103,6 +103,62 @@ def cmd_download_historic(args: argparse.Namespace) -> None:
     run_download_historic(args)
 
 
+def _build_live_overrides(args: argparse.Namespace) -> dict:
+    """Build sparse live-config overrides from CLI flags so users can tweak common knobs quickly."""
+    overrides: dict = {}
+    if getattr(args, "dry_run", None) is not None:
+        overrides["dry_run"] = bool(args.dry_run)
+    if getattr(args, "poll_interval_seconds", None) is not None:
+        overrides["poll_interval_seconds"] = float(args.poll_interval_seconds)
+
+    max_iterations = getattr(args, "max_iterations", None)
+    if getattr(args, "once", False):
+        max_iterations = 1
+    if max_iterations is not None:
+        overrides["max_iterations"] = int(max_iterations)
+
+    strategy_overrides = {}
+    if getattr(args, "min_edge", None) is not None:
+        strategy_overrides["min_edge"] = float(args.min_edge)
+    if strategy_overrides:
+        overrides["strategy"] = strategy_overrides
+
+    safety_overrides = {}
+    if getattr(args, "max_stake_per_market", None) is not None:
+        safety_overrides["max_stake_per_market"] = float(args.max_stake_per_market)
+    if getattr(args, "max_daily_exposure", None) is not None:
+        safety_overrides["max_daily_exposure"] = float(args.max_daily_exposure)
+    if getattr(args, "ignore_within_minutes", None) is not None:
+        safety_overrides["ignore_within_minutes"] = float(args.ignore_within_minutes)
+    if safety_overrides:
+        overrides["safety"] = safety_overrides
+    return overrides
+
+
+def cmd_live(args: argparse.Namespace) -> None:
+    """Run live polling + inference + execution with optional CLI overrides for fast operational control."""
+    from shared.live.betfair_live import run_live_loop, write_live_config_template
+
+    if getattr(args, "write_config", None):
+        try:
+            output_path = write_live_config_template(args.write_config, overwrite=args.force)
+        except FileExistsError as exc:
+            log(str(exc))
+            return
+        log(f"Live: wrote starter config to {output_path}")
+        return
+
+    config_path = getattr(args, "config", None) or "config/live.yaml"
+    overrides = _build_live_overrides(args)
+    if overrides:
+        log(f"Live: applying CLI overrides {overrides}")
+    try:
+        run_live_loop(config_path=config_path, overrides=overrides or None)
+    except FileNotFoundError as exc:
+        log(str(exc))
+        log("Live: create a starter config with `punter live --write-config config/live.yaml`.")
+
+
 def _ensure_run_id(args: argparse.Namespace) -> None:
     """Assign a run id so training/backtests can be tied to a single CLI execution."""
     if getattr(args, "run_id", None):
@@ -948,6 +1004,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
     )
     p_score.set_defaults(func=cmd_score)
+
+    p_live = sub.add_parser(
+        "live",
+        help="Run live Betfair polling + model inference + dry-run/live execution.",
+    )
+    p_live.add_argument(
+        "--config",
+        default="config/live.yaml",
+        help="Path to live YAML config (default: config/live.yaml).",
+    )
+    p_live.add_argument(
+        "--write-config",
+        help="Write a starter live config to this path and exit.",
+    )
+    p_live.add_argument(
+        "--wirte-config",
+        dest="write_config",
+        help=argparse.SUPPRESS,
+    )
+    p_live.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing file when used with --write-config.",
+    )
+    p_live_mode = p_live.add_mutually_exclusive_group()
+    p_live_mode.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="Override config and simulate orders without placing them.",
+    )
+    p_live_mode.add_argument(
+        "--live",
+        dest="dry_run",
+        action="store_false",
+        help="Override config and enable real order placement.",
+    )
+    p_live.set_defaults(dry_run=None)
+    p_live.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one polling iteration and exit.",
+    )
+    p_live.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Override max polling iterations from config.",
+    )
+    p_live.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        help="Override poll interval from config.",
+    )
+    p_live.add_argument(
+        "--min-edge",
+        type=float,
+        help="Override strategy.min_edge from config.",
+    )
+    p_live.add_argument(
+        "--max-stake-per-market",
+        type=float,
+        help="Override safety.max_stake_per_market from config.",
+    )
+    p_live.add_argument(
+        "--max-daily-exposure",
+        type=float,
+        help="Override safety.max_daily_exposure from config.",
+    )
+    p_live.add_argument(
+        "--ignore-within-minutes",
+        type=float,
+        help="Override safety.ignore_within_minutes from config.",
+    )
+    p_live.set_defaults(func=cmd_live)
 
     p_pipe = sub.add_parser("pipeline", help="Run ingest (optional), features, train, backtest, score")
     p_pipe.add_argument("--archive", help="Optional tar archive to ingest first")

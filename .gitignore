@@ -28,3 +28,6 @@ artifacts/*.csv
 artifacts/*.json
 
 .DS_Store
+
+# Local DB backups
+data/backups/

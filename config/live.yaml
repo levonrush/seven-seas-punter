@@ -1,0 +1,32 @@
+dry_run: true
+poll_interval_seconds: 10
+max_iterations: null
+model:
+  cutoff_minutes: 10
+  model_path: artifacts/model_cutoff_10.joblib
+  calibrator_path: artifacts/calibrator_cutoff_10.joblib
+markets:
+  event_type_id: '7'
+  market_countries:
+  - AU
+  market_type_codes:
+  - WIN
+  start_in_minutes: 5
+  horizon_minutes: 240
+  max_results: 200
+  sort: FIRST_TO_START
+strategy:
+  stake_per_bet: 1.0
+  min_ev: 0.02
+  min_edge: 0.1
+  min_prob: null
+  commission: 0.05
+  per_market_limit: 1
+  persistence_type: LAPSE
+safety:
+  max_stake_per_market: 5.0
+  max_daily_exposure: 50.0
+  ignore_within_minutes: 5
+state:
+  exposure_path: artifacts/live_exposure_state.json
+  decision_log_path: artifacts/live_decisions.csv

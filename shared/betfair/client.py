@@ -16,6 +16,27 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+def _resolve_cert_files(cert_path: Optional[str], cert_file: Optional[str], key_file: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve cert/key file paths so automation can use either explicit files or a cert directory."""
+    resolved_cert = cert_file
+    resolved_key = key_file
+    if cert_path and not (resolved_cert and resolved_key):
+        cert_candidates = [
+            os.path.join(cert_path, "client-2048.crt"),
+            os.path.join(cert_path, "client.crt"),
+        ]
+        key_candidates = [
+            os.path.join(cert_path, "client-2048.key"),
+            os.path.join(cert_path, "client.key"),
+        ]
+        for cert_candidate, key_candidate in zip(cert_candidates, key_candidates):
+            if os.path.isfile(cert_candidate) and os.path.isfile(key_candidate):
+                resolved_cert = cert_candidate
+                resolved_key = key_candidate
+                break
+    return resolved_cert, resolved_key
+
+
 class BetfairClient:
     """Minimal Betfair API wrapper with a dry-run fallback so workflows can run without credentials."""
 
@@ -24,8 +45,10 @@ class BetfairClient:
         self.app_key = app_key or os.getenv("BETFAIR_APP_KEY")
         self.username = username or os.getenv("BETFAIR_USERNAME")
         self.password = password or os.getenv("BETFAIR_PASSWORD")
+        cert_path = os.getenv("BETFAIR_CERT_PATH")
         self.cert_file = os.getenv("BETFAIR_CERT_FILE")
         self.key_file = os.getenv("BETFAIR_KEY_FILE")
+        self.cert_file, self.key_file = _resolve_cert_files(cert_path, self.cert_file, self.key_file)
         if self.cert_file and not os.path.isfile(self.cert_file):
             logger.warning("BetfairClient: cert file missing, ignoring %s.", self.cert_file)
             log(f"BetfairClient: cert file missing, ignoring {self.cert_file}.")
@@ -68,31 +91,59 @@ class BetfairClient:
         self, date: dt.date, country: str = "AU", event_type: str = "horse_racing"
     ) -> List[Dict[str, Any]]:
         """Retrieve market catalogues for a given date; returns mocks when dry-run."""
-        if self._dry_run or not self._client:
-            return self._mock_catalogues(date)
-
-        market_filter = betfairlightweight.filters.market_filter(
-            event_type_ids=[self._lookup_event_type_id(event_type)],
-            market_countries=[country],
-            market_start_time={
+        market_filter = {
+            "event_type_ids": [self._lookup_event_type_id(event_type)],
+            "market_countries": [country],
+            "market_start_time": {
                 "from": dt.datetime.combine(date, dt.time.min).isoformat(),
                 "to": dt.datetime.combine(date, dt.time.max).isoformat(),
             },
-        )
-        catalogue = self._client.betting.list_market_catalogue(
-            filter=market_filter,
-            market_projection=["MARKET_START_TIME", "EVENT", "RUNNER_METADATA"],
+        }
+        return self.list_market_catalogue(
+            market_filter=market_filter,
+            market_projection=["MARKET_START_TIME", "EVENT", "RUNNER_METADATA", "MARKET_DESCRIPTION"],
             max_results=1000,
+            sort="FIRST_TO_START",
+            country_code=country,
+            event_type=event_type,
+        )
+
+    def list_market_catalogue(
+        self,
+        market_filter: Dict[str, Any],
+        market_projection: Optional[List[str]] = None,
+        max_results: int = 200,
+        sort: str = "FIRST_TO_START",
+        country_code: Optional[str] = None,
+        event_type: str = "horse_racing",
+    ) -> List[Dict[str, Any]]:
+        """Return normalized market catalogue rows so live polling can use the same shape as historic workflows."""
+        market_projection = market_projection or ["MARKET_START_TIME", "EVENT", "RUNNER_METADATA", "MARKET_DESCRIPTION"]
+        if self._dry_run or not self._client:
+            return self._mock_catalogues(dt.date.today())
+
+        api_filter = betfairlightweight.filters.market_filter(**market_filter)
+        catalogue = self._client.betting.list_market_catalogue(
+            filter=api_filter,
+            market_projection=market_projection,
+            sort=sort,
+            max_results=max_results,
         )
         results = []
         for item in catalogue:
+            event = getattr(item, "event", None)
+            description = getattr(item, "description", None)
+            result_country = country_code
+            if not result_country and event and getattr(event, "country_code", None):
+                result_country = event.country_code
             results.append(
                 {
                     "market_id": item.market_id,
-                    "venue": item.event.venue,
+                    "venue": event.venue if event else None,
                     "race_start_time": item.market_start_time,
                     "race_name": item.market_name,
-                    "country_code": country,
+                    "market_type": description.market_type if description else None,
+                    "country_code": result_country,
                     "event_type": event_type,
                     "runners": [
                         {
@@ -143,6 +194,53 @@ class BetfairClient:
                 )
         return payload
 
+    def place_orders(
+        self,
+        market_id: str,
+        instructions: List[Dict[str, Any]],
+        customer_ref: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Place orders with a normalized response so execution and tests share one interface."""
+        if self._dry_run or not self._client:
+            return {
+                "status": "DRY_RUN",
+                "market_id": market_id,
+                "instruction_reports": [
+                    {
+                        "status": "SIMULATED",
+                        "error_code": None,
+                        "bet_id": None,
+                        "placed_date": None,
+                        "size_matched": 0.0,
+                        "average_price_matched": 0.0,
+                    }
+                    for _ in instructions
+                ],
+            }
+        response = self._client.betting.place_orders(
+            market_id=market_id,
+            instructions=instructions,
+            customer_ref=customer_ref,
+        )
+        reports = []
+        for report in getattr(response, "instruction_reports", []):
+            reports.append(
+                {
+                    "status": report.status,
+                    "error_code": getattr(report, "error_code", None),
+                    "bet_id": getattr(report, "bet_id", None),
+                    "placed_date": getattr(report, "placed_date", None),
+                    "size_matched": getattr(report, "size_matched", None),
+                    "average_price_matched": getattr(report, "average_price_matched", None),
+                }
+            )
+        return {
+            "status": getattr(response, "status", None),
+            "market_id": market_id,
+            "customer_ref": customer_ref,
+            "instruction_reports": reports,
+        }
+
     def fetch_market_results(self, market_ids: Iterable[str]) -> List[Dict[str, Any]]:
         """Fetch results; dry-run derives winners from mock data while live mode uses cleared orders proxy."""
         market_ids = list(market_ids)
@@ -184,6 +282,7 @@ class BetfairClient:
                     "venue": f"Mockville {i}",
                     "race_start_time": base_time + dt.timedelta(minutes=30 * i),
                     "race_name": f"Dry Run Stakes {i}",
+                    "market_type": "WIN",
                     "country_code": "AU",
                     "event_type": "horse_racing",
                     "runners": [

@@ -27,6 +27,12 @@ punter backtest --cutoff-minutes 10 --split-date 2017-04-01 --run-id myrun
 punter report --run-id myrun
 ```
 
+Live polling loop (dry-run by default in starter config):
+```bash
+punter live --write-config config/live.yaml
+punter live --config config/live.yaml --once
+```
+
 ## Key scripts
 - `cli.py`: unified `punter` CLI (recommended).
 - `download_historic.py`: Betfair Historic API downloader (manifest + list cache).
@@ -35,6 +41,7 @@ punter report --run-id myrun
 - `train_model.py`: train + calibrate model.
 - `backtest.py`: run value strategy backtest.
 - `score_today.py`: score and write a CSV of opportunities.
+- `live_betfair.py`: live polling/inference/execution entrypoint (`punter live` wraps this flow).
 
 ## Split options
 - `--split-date YYYY-MM-DD`: train on races before date, backtest on races on/after it.

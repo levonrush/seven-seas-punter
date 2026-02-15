@@ -81,3 +81,12 @@ All notable changes to this project will be documented in this file.
 - Backtests now filter to WIN markets when market_type is available to keep targets consistent.
 - Backtest metrics now include average predicted win rate and the prediction gap versus actuals.
 - Added AGENTS.md with repository guidance for automated agents.
+- Split-date defaults now use snapshot race times when available to avoid future market rows skewing the max date.
+- Added local Betfair API implementation notes under `docs/betfair_api/` for auth, discovery, prices, execution, and rate limits.
+- Added a live polling runner at `workflow/live_betfair.py` with core logic in `shared/live/betfair_live.py`.
+- Added live safety controls for dry-run default, per-market stake cap, and daily exposure cap with persisted exposure state.
+- Extended `BetfairClient` with `list_market_catalogue` and `place_orders`, plus `BETFAIR_CERT_PATH` support.
+- Added `docs/live_integration_plan.md` documenting current feature/inference interfaces and live integration mapping.
+- Added tests for live dry-run behavior, market stake-cap enforcement, and a mocked live iteration flow.
+- Added `punter live` CLI command with starter-config generation and operational override flags (`--once`, `--dry-run/--live`, stake/exposure overrides).
+- Added a compatibility alias (`--wirte-config`) for `punter live` starter config generation to tolerate the common typo.
