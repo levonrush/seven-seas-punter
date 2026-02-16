@@ -90,3 +90,7 @@ All notable changes to this project will be documented in this file.
 - Added tests for live dry-run behavior, market stake-cap enforcement, and a mocked live iteration flow.
 - Added `punter live` CLI command with starter-config generation and operational override flags (`--once`, `--dry-run/--live`, stake/exposure overrides).
 - Added a compatibility alias (`--wirte-config`) for `punter live` starter config generation to tolerate the common typo.
+- `download-historic` now defaults to `--market-types ALL` (no market-type filter) instead of WIN-only.
+- Added `download-historic --show-market-types` to print available market types with counts before downloading.
+- Added normalization for `--market-types` so `ALL`/`*` explicitly disables market-type filtering.
+- Added retry/backoff for historic `GetMyData` calls and made timeout configurable via `BETFAIR_HISTORIC_TIMEOUT` (default 60s).

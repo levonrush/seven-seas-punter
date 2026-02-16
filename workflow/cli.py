@@ -798,11 +798,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_hist.add_argument("--to-date", help="End date (YYYY-MM-DD).")
     p_hist.add_argument("--sport", default="Horse Racing", help="Sport name (e.g., Horse Racing).")
     p_hist.add_argument("--plan", help="Plan name (e.g., Basic Plan). Omit for all plans in --auto.")
-    p_hist.add_argument("--market-types", default="WIN", help="Comma-separated market types.")
+    p_hist.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types. Use ALL (default) for no market-type filter.",
+    )
     p_hist.add_argument("--countries", default="AU", help="Comma-separated country codes.")
     p_hist.add_argument("--file-types", default="M", help="Comma-separated file types (M/E).")
     p_hist.add_argument("--event-id", type=int)
     p_hist.add_argument("--event-name")
+    p_hist.add_argument(
+        "--show-market-types",
+        action="store_true",
+        help="Print available market types (with counts) for the selected window and exit.",
+    )
     p_hist.add_argument("--show-options", action="store_true", help="Show available filters.")
     p_hist.add_argument("--size-only", action="store_true", help="Only show file count and size.")
     p_hist.add_argument("--list-only", action="store_true", help="Only list available files.")

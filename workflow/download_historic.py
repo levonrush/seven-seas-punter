@@ -31,6 +31,49 @@ def _split_csv(value: str | None) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _normalize_market_types(values: List[str]) -> List[str]:
+    """Normalize market-type filters and treat ALL/* as no filter."""
+    if not values:
+        return []
+    normalized = []
+    seen = set()
+    for value in values:
+        token = value.strip().upper()
+        if not token:
+            continue
+        if token in {"ALL", "*"}:
+            return []
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _print_market_types(options: dict) -> None:
+    """Print available market types in a compact format for quick filter selection."""
+    items = options.get("marketTypesCollection") or []
+    if not items:
+        print("No market types returned for this filter.")
+        return
+    rows = []
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            count = item.get("count")
+        else:
+            name = str(item).strip()
+            count = None
+        if not name:
+            continue
+        rows.append((name, count))
+    rows = sorted(rows, key=lambda row: (-(row[1] or 0), row[0]))
+    print("Available market types:")
+    for name, count in rows:
+        suffix = f" ({count})" if isinstance(count, int) else ""
+        print(f"- {name}{suffix}")
+
+
 def _resolve_workers(value: int | None) -> tuple[int, bool]:
     """Choose a safe default worker count for downloads."""
     if value and value > 0:
@@ -202,16 +245,26 @@ def run_download_historic(args: argparse.Namespace) -> None:
     if not args.auto and not args.from_date and not args.to_date:
         log("Historic download: no date range supplied; defaulting to --auto.")
         args.auto = True
-    if not (args.download or args.list_only or args.size_only or args.show_options):
+    if not (
+        args.download
+        or args.list_only
+        or args.size_only
+        or args.show_options
+        or args.show_market_types
+    ):
         args.download = True
     workers, auto_workers = _resolve_workers(args.workers)
     args.workers = workers
     if auto_workers:
         label = "worker" if workers == 1 else "workers"
         log(f"Historic download: using {workers} {label} (default).")
-    market_types = _split_csv(args.market_types)
+    market_types = _normalize_market_types(_split_csv(args.market_types))
     countries = _split_csv(args.countries)
     file_types = _split_csv(args.file_types)
+    if market_types:
+        log(f"Historic download: market type filter -> {','.join(market_types)}.")
+    else:
+        log("Historic download: market type filter disabled (ALL market types).")
 
     client = HistoricDataClient()
 
@@ -239,9 +292,12 @@ def run_download_historic(args: argparse.Namespace) -> None:
             event_name=args.event_name,
         ).to_payload()
 
-        if args.show_options:
+        if args.show_options or args.show_market_types:
             options = client.get_collection_options(payload)
-            print(dump_json(options))
+            if args.show_market_types:
+                _print_market_types(options)
+            if args.show_options:
+                print(dump_json(options))
             return []
         if args.size_only:
             size = client.get_basket_size(payload)
@@ -312,7 +368,7 @@ def run_download_historic(args: argparse.Namespace) -> None:
         return files
 
     if args.auto:
-        packages = client.get_my_data()
+        packages = client.get_my_data(retries=args.retries, retry_wait=args.retry_wait)
         sport_filter = args.sport.lower()
         plan_filter = None
         if args.plan and args.plan.lower() not in {"all", "*"}:
@@ -333,6 +389,16 @@ def run_download_historic(args: argparse.Namespace) -> None:
             package_months.append((for_date, pkg.get("plan")))
         if not package_months:
             log("Historic download: no matching packages found.")
+            return
+        if args.show_market_types:
+            latest_for_date, latest_plan = sorted(package_months)[-1]
+            from_date, to_date = _month_bounds(latest_for_date)
+            plan_name = latest_plan or args.plan or "Basic Plan"
+            log(
+                "Historic download: showing market types for "
+                f"{from_date.isoformat()} to {to_date.isoformat()} ({plan_name})."
+            )
+            handle_window(from_date, to_date, plan_name)
             return
         output_tar = Path(args.output) if args.output else Path("data/data.tar")
         _seed_manifest_from_tar(manifest, output_tar)
@@ -435,11 +501,20 @@ def main() -> None:
     parser.add_argument("--to-date", help="End date (YYYY-MM-DD).")
     parser.add_argument("--sport", default="Horse Racing", help="Sport name (e.g., Horse Racing).")
     parser.add_argument("--plan", default="Basic Plan", help="Plan name (e.g., Basic Plan).")
-    parser.add_argument("--market-types", default="WIN", help="Comma-separated market types.")
+    parser.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types. Use ALL (default) for no market-type filter.",
+    )
     parser.add_argument("--countries", default="AU", help="Comma-separated country codes.")
     parser.add_argument("--file-types", default="M", help="Comma-separated file types (M/E).")
     parser.add_argument("--event-id", type=int)
     parser.add_argument("--event-name")
+    parser.add_argument(
+        "--show-market-types",
+        action="store_true",
+        help="Print available market types (with counts) for the selected window and exit.",
+    )
     parser.add_argument("--show-options", action="store_true", help="Show available filters.")
     parser.add_argument("--size-only", action="store_true", help="Only show file count and size.")
     parser.add_argument("--list-only", action="store_true", help="Only list available files.")

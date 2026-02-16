@@ -13,6 +13,10 @@ Historic download (auto, resume from manifest):
 ```bash
 punter download-historic --auto
 ```
+Show available market types before downloading:
+```bash
+punter download-historic --auto --show-market-types
+```
 
 Incremental ingest (only new archive members):
 ```bash

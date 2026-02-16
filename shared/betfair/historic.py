@@ -88,6 +88,7 @@ class HistoricDataClient:
         if not all([self.app_key, self.username, self.password]):
             raise ValueError("Missing BETFAIR_APP_KEY/BETFAIR_USERNAME/BETFAIR_PASSWORD.")
         self.session = requests.Session()
+        self.historic_timeout = float(os.getenv("BETFAIR_HISTORIC_TIMEOUT", "60"))
         self.ssoid = self._login()
 
     def _login(self) -> str:
@@ -151,11 +152,35 @@ class HistoricDataClient:
         """Return headers required for historic data endpoints."""
         return {"ssoid": self.ssoid}
 
-    def get_my_data(self) -> List[Dict[str, Any]]:
-        """Return the historic data packages available to the account."""
-        resp = self.session.get(f"{HISTORIC_BASE_URL}/GetMyData", headers=self._headers(), timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+    def get_my_data(
+        self,
+        retries: int = 3,
+        retry_wait: float = 2.0,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return purchased historic packages with retries because this call can timeout on large accounts."""
+        attempts = max(1, int(retries))
+        read_timeout = float(timeout if timeout is not None else self.historic_timeout)
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self.session.get(
+                    f"{HISTORIC_BASE_URL}/GetMyData",
+                    headers=self._headers(),
+                    timeout=read_timeout,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException as exc:
+                if attempt < attempts:
+                    wait_for = retry_wait * attempt
+                    log(
+                        "HistoricDataClient: "
+                        f"GetMyData failed ({exc}); retrying in {wait_for}s "
+                        f"(attempt {attempt}/{attempts})."
+                    )
+                    time.sleep(wait_for)
+                    continue
+                raise
 
     def get_collection_options(self, filter_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Return available market/country/file filters for a given request window."""

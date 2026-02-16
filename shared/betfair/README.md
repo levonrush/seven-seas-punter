@@ -17,6 +17,7 @@ Optional SSO overrides and retries:
 - `BETFAIR_SSO_URL` (e.g., `https://identitysso.betfair.com.au/api/login`)
 - `BETFAIR_SSO_RETRIES`
 - `BETFAIR_SSO_RETRY_WAIT`
+- `BETFAIR_HISTORIC_TIMEOUT` (seconds for historic API reads, default `60`)
 
 ## Files
 - `client.py`: lightweight wrapper used by workflow scoring.
