@@ -23,6 +23,7 @@ def _live_args(**kwargs) -> argparse.Namespace:
         "once": False,
         "max_iterations": None,
         "poll_interval_seconds": None,
+        "market_types": None,
         "min_edge": None,
         "max_stake_per_market": None,
         "max_daily_exposure": None,
@@ -38,6 +39,7 @@ def test_build_live_overrides_once_takes_precedence():
         once=True,
         max_iterations=9,
         poll_interval_seconds=2.5,
+        market_types="WIN,PLACE",
         min_edge=0.15,
         max_stake_per_market=4.0,
         max_daily_exposure=20.0,
@@ -49,6 +51,7 @@ def test_build_live_overrides_once_takes_precedence():
     assert overrides["dry_run"] is False
     assert overrides["max_iterations"] == 1
     assert overrides["poll_interval_seconds"] == 2.5
+    assert overrides["markets"]["market_type_codes"] == ["WIN", "PLACE"]
     assert overrides["strategy"]["min_edge"] == 0.15
     assert overrides["safety"]["max_stake_per_market"] == 4.0
     assert overrides["safety"]["max_daily_exposure"] == 20.0

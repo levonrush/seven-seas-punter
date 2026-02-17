@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 
+from shared.utils.market_types import api_market_type_codes
 from shared.utils.progress import log
 
 try:
@@ -88,9 +89,13 @@ class BetfairClient:
         return self._dry_run
 
     def list_markets_for_date(
-        self, date: dt.date, country: str = "AU", event_type: str = "horse_racing"
+        self,
+        date: dt.date,
+        country: str = "AU",
+        event_type: str = "horse_racing",
+        market_types: Optional[Iterable[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve market catalogues for a given date; returns mocks when dry-run."""
+        """Retrieve market catalogues for a given date with optional market-type filtering."""
         market_filter = {
             "event_type_ids": [self._lookup_event_type_id(event_type)],
             "market_countries": [country],
@@ -99,6 +104,9 @@ class BetfairClient:
                 "to": dt.datetime.combine(date, dt.time.max).isoformat(),
             },
         }
+        market_type_codes = api_market_type_codes(market_types)
+        if market_type_codes:
+            market_filter["market_type_codes"] = market_type_codes
         return self.list_market_catalogue(
             market_filter=market_filter,
             market_projection=["MARKET_START_TIME", "EVENT", "RUNNER_METADATA", "MARKET_DESCRIPTION"],

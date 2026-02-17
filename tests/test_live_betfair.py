@@ -6,6 +6,7 @@ import pytest
 from shared.live.betfair_live import (
     DEFAULT_LIVE_CONFIG,
     apply_safety_gates,
+    build_market_filter,
     run_live_iteration,
     run_live_loop,
 )
@@ -219,3 +220,13 @@ def test_run_live_loop_refuses_live_mode_when_auth_is_unavailable(tmp_path, monk
 
     with pytest.raises(RuntimeError):
         run_live_loop(str(config_path))
+
+
+def test_build_market_filter_omits_market_type_codes_when_all():
+    config = _base_config()
+    config["markets"]["market_type_codes"] = ["ALL"]
+    payload = build_market_filter(
+        config=config,
+        now_utc=dt.datetime(2026, 2, 12, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    assert "market_type_codes" not in payload

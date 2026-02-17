@@ -12,6 +12,7 @@ from shared.backtest.engine import compute_expected_value
 from shared.betfair.client import BetfairClient
 from shared.features.builder import TICK_LADDER, build_features_from_store
 from shared.model.training import load_model_and_calibrator, predict_probabilities
+from shared.utils.market_types import api_market_type_codes, market_type_matches, tokens_to_filter_set
 from shared.utils.progress import log
 
 try:
@@ -32,7 +33,7 @@ DEFAULT_LIVE_CONFIG: Dict[str, Any] = {
     "markets": {
         "event_type_id": "7",
         "market_countries": ["AU"],
-        "market_type_codes": ["WIN"],
+        "market_type_codes": ["ALL"],
         "start_in_minutes": 5,
         "horizon_minutes": 240,
         "max_results": 200,
@@ -151,22 +152,25 @@ def build_market_filter(config: dict, now_utc: dt.datetime) -> dict:
     horizon_minutes = float(market_cfg.get("horizon_minutes", 240))
     from_ts = now_utc + dt.timedelta(minutes=start_in_minutes)
     to_ts = now_utc + dt.timedelta(minutes=horizon_minutes)
-    return {
+    market_filter = {
         "event_type_ids": [str(market_cfg.get("event_type_id", "7"))],
         "market_countries": list(market_cfg.get("market_countries", ["AU"])),
-        "market_type_codes": list(market_cfg.get("market_type_codes", ["WIN"])),
         "market_start_time": {
             "from": from_ts.isoformat(),
             "to": to_ts.isoformat(),
         },
     }
+    market_type_codes = api_market_type_codes(market_cfg.get("market_type_codes", ["ALL"]))
+    if market_type_codes:
+        market_filter["market_type_codes"] = market_type_codes
+    return market_filter
 
 
 def discover_markets(client: BetfairClient, config: dict, now_utc: dt.datetime) -> list[dict]:
     """Fetch markets for live polling from config-driven filters."""
     market_cfg = config["markets"]
     market_filter = build_market_filter(config, now_utc)
-    return client.list_market_catalogue(
+    markets = client.list_market_catalogue(
         market_filter=market_filter,
         market_projection=["MARKET_START_TIME", "EVENT", "RUNNER_METADATA", "MARKET_DESCRIPTION"],
         max_results=int(market_cfg.get("max_results", 200)),
@@ -174,6 +178,12 @@ def discover_markets(client: BetfairClient, config: dict, now_utc: dt.datetime) 
         country_code=(market_cfg.get("market_countries") or [None])[0],
         event_type="horse_racing",
     )
+    selected = tokens_to_filter_set(market_cfg.get("market_type_codes", ["ALL"]))
+    if selected is None:
+        return markets
+    filtered = [market for market in markets if market_type_matches(market.get("market_type"), selected)]
+    log(f"Live: market-type filter kept {len(filtered)}/{len(markets)} markets.")
+    return filtered
 
 
 def _market_lookup(markets: list[dict]) -> dict:

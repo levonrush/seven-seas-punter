@@ -12,11 +12,16 @@ from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.predictions import build_prediction_preview
-from shared.model.market_type import bucket_market_type
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.cli_presets import go_historic_args, go_pipeline_args
+from shared.utils.market_types import (
+    api_market_type_codes,
+    market_type_matches,
+    normalize_market_type_tokens,
+    tokens_to_filter_set,
+)
 from shared.utils.progress import log
 from workflow.ingest_archive import ingest_archive_file
 
@@ -118,6 +123,12 @@ def _build_live_overrides(args: argparse.Namespace) -> dict:
         max_iterations = 1
     if max_iterations is not None:
         overrides["max_iterations"] = int(max_iterations)
+
+    markets_overrides = {}
+    if getattr(args, "market_types", None) is not None:
+        markets_overrides["market_type_codes"] = normalize_market_type_tokens(args.market_types)
+    if markets_overrides:
+        overrides["markets"] = markets_overrides
 
     strategy_overrides = {}
     if getattr(args, "min_edge", None) is not None:
@@ -252,18 +263,17 @@ def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None
     log(f"Split date set to {split_date} ({label}).")
 
 
-def _filter_to_win_markets(feature_df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Filter to WIN markets so win-target evaluation remains consistent."""
-    if feature_df.empty or "market_type" not in feature_df.columns:
+def _filter_to_market_types(feature_df: pd.DataFrame, label: str, market_tokens: list[str]) -> pd.DataFrame:
+    """Filter rows by market type tokens so train/backtest/score can align to user scope."""
+    selected = tokens_to_filter_set(market_tokens)
+    if selected is None:
         return feature_df
-    buckets = feature_df["market_type"].apply(bucket_market_type)
-    win_mask = buckets == "WIN"
-    if win_mask.any():
-        filtered = feature_df.loc[win_mask].copy()
-        log(f"{label}: filtered to WIN markets ({len(filtered)}/{len(feature_df)} rows).")
-        return filtered
-    log(f"{label}: no WIN markets found; keeping all rows.")
-    return feature_df
+    if feature_df.empty or "market_type" not in feature_df.columns:
+        return feature_df.iloc[0:0].copy()
+    mask = feature_df["market_type"].apply(lambda value: market_type_matches(value, selected))
+    filtered = feature_df.loc[mask].copy()
+    log(f"{label}: market-type filter kept {len(filtered)}/{len(feature_df)} rows.")
+    return filtered
 
 
 def _load_oof_predictions_for_backtest(
@@ -311,6 +321,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     """Train LightGBM (Optuna tuned) + calibrator and persist artefacts."""
     print(f"Training model (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
     _ensure_run_id(args)
     _apply_split_from_days(args, store)
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
@@ -321,9 +332,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         log(f"Training: split-date {args.split_date} -> {len(train_features)} train rows.")
     else:
         log("Training: no split-date set; training on full dataset (in-sample).")
-    train_features = _filter_to_win_markets(train_features, "Training")
+    train_features = _filter_to_market_types(train_features, "Training", market_tokens)
     if test_features is not None:
-        test_features = _filter_to_win_markets(test_features, "Holdout")
+        test_features = _filter_to_market_types(test_features, "Holdout", market_tokens)
     if train_features.empty:
         log("Training: no features available after split; skipping.")
         return
@@ -435,6 +446,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest value strategy using trained model (or implied probs fallback)."""
     print(f"Backtesting (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
     _ensure_backtest_run_id(args, store)
     if not getattr(args, "run_id", None):
         _ensure_run_id(args)
@@ -445,7 +457,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         log(f"Backtest: split-date {args.split_date} -> {len(features)} rows.")
     else:
         log("Backtest: no split-date set; backtest is in-sample.")
-    features = _filter_to_win_markets(features, "Backtest")
+    features = _filter_to_market_types(features, "Backtest", market_tokens)
     if features.empty:
         log("Backtest: no features available after split; skipping.")
         return
@@ -506,12 +518,20 @@ def cmd_score(args: argparse.Namespace) -> None:
     from workflow.score_today import _capture_latest_snapshots
 
     today = dt.date.today()
+    market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
+    selected = tokens_to_filter_set(market_tokens)
     client = BetfairClient()
     if args.dry_run:
         client._dry_run = True  # type: ignore[attr-defined]
     store = DuckDBStore()
 
-    markets = client.list_markets_for_date(today)
+    markets = client.list_markets_for_date(today, market_types=api_market_type_codes(market_tokens))
+    if selected is not None:
+        markets = [market for market in markets if market_type_matches(market.get("market_type"), selected)]
+        log(f"Score: market-type filter kept {len(markets)} markets.")
+    if not markets:
+        log("Score: no markets returned for selected market types.")
+        return
     store.upsert_markets(markets)
     market_ids = [m["market_id"] for m in markets]
     runner_rows = [r for m in markets for r in m["runners"]]
@@ -521,7 +541,7 @@ def cmd_score(args: argparse.Namespace) -> None:
     store.append_snapshots(snapshots)
 
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
-    features = _filter_to_win_markets(features, "Score")
+    features = _filter_to_market_types(features, "Score", market_tokens)
     if features.empty:
         log("No features available for scoring.")
         return
@@ -953,6 +973,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_train = sub.add_parser("train", help="Train model at cutoff")
     p_train.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_train.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). ALL disables filtering.",
+    )
+    p_train.add_argument(
         "--split-date",
         help="ISO date/time; training uses races strictly before this (leakage-safe split).",
     )
@@ -1064,6 +1089,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bt = sub.add_parser("backtest", help="Backtest value strategy")
     p_bt.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
+    p_bt.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). ALL disables filtering.",
+    )
     p_bt.add_argument("--commission", type=float, default=0.05)
     p_bt.add_argument("--min-ev", type=float, default=0.02)
     p_bt.add_argument("--min-edge", type=float, default=0.1)
@@ -1114,6 +1144,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--dry-run", action="store_true")
     p_score.add_argument("--output")
     p_score.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). ALL disables filtering.",
+    )
+    p_score.add_argument(
         "--min-prob",
         type=float,
         help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
@@ -1146,6 +1181,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pub.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_pub.add_argument("--dry-run", action="store_true", help="Use mock data even if credentials exist.")
+    p_pub.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). ALL disables filtering.",
+    )
     p_pub.add_argument(
         "--output",
         help="Output CSV path (defaults to artifacts/pub_sheet_<YYYY-MM-DD>.csv).",
@@ -1229,6 +1269,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override poll interval from config.",
     )
     p_live.add_argument(
+        "--market-types",
+        help="Override live market types (comma-separated). Use ALL to disable market-type filtering.",
+    )
+    p_live.add_argument(
         "--min-edge",
         type=float,
         help="Override strategy.min_edge from config.",
@@ -1268,6 +1312,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
     )
     p_pipe.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
+    p_pipe.add_argument(
+        "--market-types",
+        default="ALL",
+        help="Comma-separated market types/buckets for train/backtest/score. ALL disables filtering.",
+    )
     p_pipe.add_argument("--commission", type=float, default=0.05)
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
     p_pipe.add_argument("--min-edge", type=float, default=0.1)

@@ -4,13 +4,18 @@
 
 Welcome to the Punters Club at the Seven Seas Hotel — where we turn pre-jump markets into pre-pub tall tales. The plan: scoop Betfair data, bottle it into features, train a model that can spot value, and then roll up with a cheeky shortlist of bets that *might* just pay for the next round. And yes, the entire project is vibe coded, plus a healthy dose of “blind coding” when the dev team is at the Sevens and absolutely blind.
 
-Pipeline for Betfair Exchange AU horse racing: download markets, snapshot odds, build leakage-safe features, train calibrated models, backtest value strategies, and score daily opportunities.
+Pipeline for Betfair Exchange horse racing: download markets, snapshot odds, build leakage-safe features, train calibrated models, backtest value strategies, and score daily opportunities.
 
 ## At a glance
 - Build a local DuckDB of markets, runners, and snapshots.
 - Train LightGBM models with time-based CV and calibrated probabilities.
 - Backtest value strategies with commission and basic execution filters.
 - Score “today” (or dry-run) and export a CSV of opportunities.
+
+## Current scope (February 17, 2026)
+- Live and pub scoring paths now default to ALL market types unless you set a filter.
+- Country defaults are still AU across most commands.
+- The project is most battle-tested on horse-racing WIN-style modeling; non-WIN market coverage is available but less validated.
 
 ## Repo map
 - `workflow/`: CLI entrypoints and orchestration. See `workflow/README.md`.
@@ -97,6 +102,8 @@ punter live --config config/live.yaml --once --dry-run
 punter live --config config/live.yaml --dry-run
 # switch to real order placement only after dry-run checks
 punter live --config config/live.yaml --live
+# optional market-type filter (default is ALL)
+punter live --config config/live.yaml --market-types WIN,PLACE
 ```
 
 Use this when you want a pub/day sheet for manual bets:
@@ -106,6 +113,8 @@ punter pub
 
 # optional: tune filters/output path
 punter pub --cutoff-minutes 10 --min-prob 0.12 --output artifacts/pub_sheet.csv
+# optional market-type filter (default is ALL)
+punter pub --market-types WIN,EXACTA
 
 # optional: allocate stakes from a day budget (fractional Kelly by default)
 punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2

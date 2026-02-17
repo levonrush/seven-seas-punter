@@ -18,6 +18,7 @@ def _pub_args(**kwargs) -> argparse.Namespace:
     defaults = {
         "cutoff_minutes": 10,
         "dry_run": False,
+        "market_types": "ALL",
         "output": None,
         "min_prob": None,
         "budget": None,
@@ -51,6 +52,7 @@ def test_parser_accepts_pub_alias_sheet():
     args = parser.parse_args(["sheet"])
     assert args.command == "sheet"
     assert args.func is cmd_pub
+    assert args.market_types == "ALL"
 
 
 def test_parser_accepts_pub_budget_options():

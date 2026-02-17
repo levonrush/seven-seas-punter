@@ -106,3 +106,6 @@ All notable changes to this project will be documented in this file.
 - Documented Kelly fraction stake sizing and budget allocation controls in README/workflow docs.
 - Simplified Kelly documentation to a brief conceptual explanation focused on risk scaling.
 - Added a concise Kelly theory section (formula, assumptions, and fractional-Kelly rationale) in `shared/backtest/README.md` and linked it from top-level docs.
+- Live market discovery now defaults to ALL market types (`market_type_codes: [ALL]`) with optional CLI override.
+- Added market-type filtering flags for `train`, `backtest`, `score`, and `pub`, all defaulting to `ALL`.
+- Updated README/workflow docs with a clear current-scope statement (ALL market types by default, AU country defaults, WIN strongest validation).

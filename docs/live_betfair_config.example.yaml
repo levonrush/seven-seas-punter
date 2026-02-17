@@ -12,7 +12,7 @@ markets:
   market_countries:
     - AU
   market_type_codes:
-    - WIN
+    - ALL
   start_in_minutes: 5
   horizon_minutes: 240
   max_results: 200

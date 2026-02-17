@@ -50,6 +50,11 @@ Pub/manual betting sheet from live markets:
 punter pub
 ```
 
+Current operational scope (February 17, 2026):
+- Live and pub flows default to ALL market types.
+- Country defaults remain AU.
+- Modeling quality is strongest on WIN-style markets; broader market types are supported but less validated.
+
 ## Key scripts
 - `cli.py`: unified `punter` CLI (recommended).
 - `download_historic.py`: Betfair Historic API downloader (manifest + list cache).
@@ -67,6 +72,7 @@ punter live --write-config config/live.yaml
 punter live --config config/live.yaml --once --dry-run
 punter live --config config/live.yaml --dry-run
 punter live --config config/live.yaml --live
+punter live --config config/live.yaml --market-types WIN,PLACE
 ```
 
 Manual day sheet (pub mode):
@@ -74,6 +80,7 @@ Manual day sheet (pub mode):
 punter pub
 punter pub --min-prob 0.12 --output artifacts/pub_sheet.csv
 punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2
+punter pub --market-types WIN,EXACTA
 ```
 
 Kelly fraction (brief):
@@ -107,6 +114,7 @@ When you need control beyond `punter go`, tune directly with command-specific fl
 - Ingest tuning: `punter ingest --help`
 - Modeling/backtest/scoring tuning: `punter pipeline --help`
 - Live execution tuning: `punter live --help`
+- Market-type scope tuning: `--market-types` on `train`, `backtest`, `score`, `pub`, and `live`.
 
 ## Ingest behavior
 - Incremental ingest uses `data/ingest_manifest.json` to skip already ingested members.
