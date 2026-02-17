@@ -94,3 +94,15 @@ All notable changes to this project will be documented in this file.
 - Added `download-historic --show-market-types` to print available market types with counts before downloading.
 - Added normalization for `--market-types` so `ALL`/`*` explicitly disables market-type filtering.
 - Added retry/backoff for historic `GetMyData` calls and made timeout configurable via `BETFAIR_HISTORIC_TIMEOUT` (default 60s).
+- Added historic API request throttling (`BETFAIR_HISTORIC_MAX_REQUESTS` / `BETFAIR_HISTORIC_REQUEST_WINDOW`) with CLI overrides.
+- Added automatic date-window sharding for historic downloads using `GetAdvBasketDataSize` to keep baskets under a target size.
+- Added adaptive historic download retry rounds that back off worker count after transient failures.
+- Added `punter go` (`punter auto`) as a one-command optimized CLI flow: historic download + incremental pipeline.
+- Added shared CLI presets for no-tune runs (`shared/utils/cli_presets.py`) and documented tuning paths in README/workflow docs.
+- Switched `download-historic` worker default from `1` to auto (2..8 based on CPU) for faster out-of-the-box runs.
+- Added `punter pub` (`punter sheet`) as a pub-friendly daily shortlist command built on live market scoring.
+- Added a clear two-mode usage guide in README/workflow docs (automatic API execution vs manual pub sheet).
+- Added budget-aware stake allocation for `punter pub`/`punter score` with fractional Kelly and equal-weight options.
+- Documented Kelly fraction stake sizing and budget allocation controls in README/workflow docs.
+- Simplified Kelly documentation to a brief conceptual explanation focused on risk scaling.
+- Added a concise Kelly theory section (formula, assumptions, and fractional-Kelly rationale) in `shared/backtest/README.md` and linked it from top-level docs.

@@ -11,11 +11,12 @@ import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 import requests
 
 from shared.betfair.historic import HistoricDataClient, build_filter, dump_json
+from shared.utils.cli_presets import recommended_historic_workers
 from shared.utils.progress import log
 
 
@@ -75,10 +76,10 @@ def _print_market_types(options: dict) -> None:
 
 
 def _resolve_workers(value: int | None) -> tuple[int, bool]:
-    """Choose a safe default worker count for downloads."""
+    """Choose a fast but stable default worker count for historic downloads."""
     if value and value > 0:
         return value, False
-    return 1, True
+    return recommended_historic_workers(), True
 
 
 def _default_output(from_date: dt.date, to_date: dt.date) -> Path:
@@ -92,6 +93,167 @@ def _month_bounds(date_value: dt.date) -> tuple[dt.date, dt.date]:
     first = date_value.replace(day=1)
     last_day = calendar.monthrange(date_value.year, date_value.month)[1]
     return first, date_value.replace(day=last_day)
+
+
+def _build_payload(
+    args: argparse.Namespace,
+    from_date: dt.date,
+    to_date: dt.date,
+    plan_name: str,
+    market_types: list[str],
+    countries: list[str],
+    file_types: list[str],
+) -> dict:
+    """Build the historic API payload once so list/size/shard calls stay in sync."""
+    return build_filter(
+        sport=args.sport,
+        plan=plan_name,
+        from_day=from_date.day,
+        from_month=from_date.month,
+        from_year=from_date.year,
+        to_day=to_date.day,
+        to_month=to_date.month,
+        to_year=to_date.year,
+        market_types=market_types,
+        countries=countries,
+        file_types=file_types,
+        event_id=args.event_id,
+        event_name=args.event_name,
+    ).to_payload()
+
+
+def _iter_numeric_fields(value: object, path: str = "") -> Iterable[Tuple[str, float]]:
+    """Yield numeric leaf values with their dotted paths to simplify flexible response parsing."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            child_path = f"{path}.{key_text}" if path else key_text
+            yield from _iter_numeric_fields(child, child_path)
+        return
+    if isinstance(value, list):
+        for idx, child in enumerate(value):
+            child_path = f"{path}[{idx}]"
+            yield from _iter_numeric_fields(child, child_path)
+        return
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float)):
+        yield path, float(value)
+
+
+def _extract_basket_size_mb(size_payload: dict) -> float | None:
+    """Return basket size in MB from `GetAdvBasketDataSize`, handling observed response variants."""
+    candidates: list[float] = []
+    for path, value in _iter_numeric_fields(size_payload):
+        key = path.lower()
+        if "size" not in key:
+            continue
+        if "filesize" in key:
+            continue
+        if "byte" in key:
+            candidates.append(value / (1024 * 1024))
+            continue
+        if "kb" in key:
+            candidates.append(value / 1024)
+            continue
+        if "gb" in key:
+            candidates.append(value * 1024)
+            continue
+        if "mb" in key:
+            candidates.append(value)
+            continue
+        # Historic API docs/examples usually communicate basket size as MB.
+        # If we get a very large unlabeled number, treat it as bytes.
+        if value > 100_000:
+            candidates.append(value / (1024 * 1024))
+        else:
+            candidates.append(value)
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _extract_basket_file_count(size_payload: dict) -> int | None:
+    """Return file count from `GetAdvBasketDataSize` payload for progress logging."""
+    for path, value in _iter_numeric_fields(size_payload):
+        key = path.lower()
+        if "count" in key and "size" not in key:
+            return int(value)
+        if "files" in key and "size" not in key:
+            return int(value)
+    return None
+
+
+def _split_window(from_date: dt.date, to_date: dt.date) -> tuple[tuple[dt.date, dt.date], tuple[dt.date, dt.date]]:
+    """Split a date window in half so oversized baskets can be retried with smaller API requests."""
+    span_days = (to_date - from_date).days
+    if span_days <= 0:
+        return (from_date, to_date), (to_date, to_date)
+    midpoint = from_date + dt.timedelta(days=span_days // 2)
+    left = (from_date, midpoint)
+    right = (midpoint + dt.timedelta(days=1), to_date)
+    return left, right
+
+
+def _plan_sharded_windows(
+    client: HistoricDataClient,
+    args: argparse.Namespace,
+    plan_name: str,
+    from_date: dt.date,
+    to_date: dt.date,
+    market_types: list[str],
+    countries: list[str],
+    file_types: list[str],
+) -> list[tuple[dt.date, dt.date]]:
+    """Recursively shard large windows to keep each list/download basket at a manageable size."""
+    target_mb = float(args.target_basket_mb or 0)
+    if target_mb <= 0:
+        return [(from_date, to_date)]
+    max_depth = max(0, int(args.max_shard_depth or 0))
+
+    def recurse(window_from: dt.date, window_to: dt.date, depth: int) -> list[tuple[dt.date, dt.date]]:
+        if window_from >= window_to:
+            return [(window_from, window_to)]
+        payload = _build_payload(args, window_from, window_to, plan_name, market_types, countries, file_types)
+        try:
+            size_payload = client.get_basket_size(payload)
+        except requests.RequestException as exc:
+            log(
+                "Historic download: "
+                f"basket-size probe failed for {window_from.isoformat()}->{window_to.isoformat()} "
+                f"({plan_name}); using unsplit window ({exc})."
+            )
+            return [(window_from, window_to)]
+        size_mb = _extract_basket_size_mb(size_payload)
+        if size_mb is None:
+            log(
+                "Historic download: "
+                f"basket-size probe returned unknown shape for {window_from.isoformat()}->{window_to.isoformat()} "
+                f"({plan_name}); using unsplit window."
+            )
+            return [(window_from, window_to)]
+        if size_mb <= target_mb:
+            return [(window_from, window_to)]
+        if depth >= max_depth:
+            log(
+                "Historic download: "
+                f"window {window_from.isoformat()}->{window_to.isoformat()} ({plan_name}) "
+                f"is {size_mb:.1f}MB but max shard depth reached ({max_depth}); keeping as-is."
+            )
+            return [(window_from, window_to)]
+        left, right = _split_window(window_from, window_to)
+        if left == right:
+            return [(window_from, window_to)]
+        file_count = _extract_basket_file_count(size_payload)
+        file_note = f", files={file_count}" if file_count is not None else ""
+        log(
+            "Historic download: "
+            f"sharding {window_from.isoformat()}->{window_to.isoformat()} ({plan_name}, {size_mb:.1f}MB{file_note}) "
+            f"to stay under {target_mb:.0f}MB."
+        )
+        return recurse(*left, depth + 1) + recurse(*right, depth + 1)
+
+    return recurse(from_date, to_date, 0)
 
 
 def _parse_package_month(value: str) -> dt.date:
@@ -177,6 +339,17 @@ def _seed_manifest_from_tar(manifest: dict, tar_path: Path) -> None:
                 manifest["_basenames"].add(Path(member.name).name)
 
 
+def _is_retryable_download_error(exc: Exception) -> bool:
+    """Classify transient download failures so adaptive retries focus on likely recoverable issues."""
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        return status in {408, 425, 429} or (status is not None and status >= 500)
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "temporarily unavailable" in text
+
+
 def _download_many(
     client: HistoricDataClient,
     file_paths: Iterable[str],
@@ -187,8 +360,11 @@ def _download_many(
     force: bool,
     retries: int,
     retry_wait: float,
+    adaptive_workers: bool,
+    max_rounds: int,
+    adaptive_cooldown: float,
 ) -> List[Path]:
-    """Download many files in parallel to the output directory."""
+    """Download files with optional adaptive worker backoff for transient throttling."""
     output_dir.mkdir(parents=True, exist_ok=True)
     files = []
     for file_path in file_paths:
@@ -196,36 +372,80 @@ def _download_many(
             continue
         files.append(file_path)
     saved: List[Path] = []
+    saved_names: set[str] = set()
     total = len(files)
     if total == 0:
         return saved
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {}
-        for idx, file_path in enumerate(files, start=1):
-            dest = output_dir / Path(file_path).name
-            if dest.exists() and not force:
-                _mark_downloaded(manifest, file_path, dest)
-                continue
-            futures[executor.submit(client.download_file, file_path, str(dest), retries, retry_wait)] = (
-                dest,
-                file_path,
+    pending = list(files)
+    current_workers = max(1, int(workers))
+    total_rounds = max(1, int(max_rounds))
+    done = 0
+    for round_idx in range(1, total_rounds + 1):
+        if not pending:
+            break
+        if round_idx == 1:
+            log(
+                "Historic download: "
+                f"starting round {round_idx}/{total_rounds} with {current_workers} workers ({len(pending)} files)."
             )
-            if progress_every and idx % progress_every == 0:
-                log(f"Historic download: queued {idx}/{total} files.")
-        done = 0
-        for future in as_completed(futures):
-            dest, file_path = futures[future]
-            try:
-                future.result()
-            except Exception as exc:
-                log(f"Historic download: failed {file_path} ({exc}).")
-                if dest.exists():
-                    dest.unlink(missing_ok=True)
-                continue
-            saved.append(dest)
-            done += 1
-            if progress_every and done % progress_every == 0:
-                log(f"Historic download: completed {done}/{total} files.")
+        else:
+            log(
+                "Historic download: "
+                f"retry round {round_idx}/{total_rounds} with {current_workers} workers ({len(pending)} files)."
+            )
+        round_failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=current_workers) as executor:
+            futures = {}
+            for idx, file_path in enumerate(pending, start=1):
+                dest = output_dir / Path(file_path).name
+                if dest.exists() and not force:
+                    _mark_downloaded(manifest, file_path, dest)
+                    if dest.name not in saved_names:
+                        saved.append(dest)
+                        saved_names.add(dest.name)
+                        done += 1
+                    continue
+                futures[executor.submit(client.download_file, file_path, str(dest), retries, retry_wait)] = (
+                    dest,
+                    file_path,
+                )
+                if progress_every and idx % progress_every == 0:
+                    log(f"Historic download: queued {idx}/{len(pending)} files in round {round_idx}.")
+            for future in as_completed(futures):
+                dest, file_path = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    retryable = _is_retryable_download_error(exc)
+                    if retryable and round_idx < total_rounds:
+                        round_failures.append(file_path)
+                        log(f"Historic download: transient failure for {file_path}; queued for retry.")
+                    else:
+                        log(f"Historic download: failed {file_path} ({exc}).")
+                    if dest.exists():
+                        dest.unlink(missing_ok=True)
+                    continue
+                if dest.name not in saved_names:
+                    saved.append(dest)
+                    saved_names.add(dest.name)
+                    done += 1
+                if progress_every and done % progress_every == 0:
+                    log(f"Historic download: completed {done}/{total} files.")
+        if not round_failures:
+            break
+        pending = round_failures
+        if adaptive_workers and current_workers > 1:
+            next_workers = max(1, current_workers // 2)
+            if next_workers < current_workers:
+                log(
+                    "Historic download: "
+                    f"reducing workers {current_workers}->{next_workers} after transient failures."
+                )
+            current_workers = next_workers
+        if adaptive_cooldown > 0:
+            time.sleep(adaptive_cooldown)
+    if pending and len(saved) < total:
+        log(f"Historic download: finished with {len(saved)}/{total} files downloaded.")
     return saved
 
 
@@ -266,7 +486,22 @@ def run_download_historic(args: argparse.Namespace) -> None:
     else:
         log("Historic download: market type filter disabled (ALL market types).")
 
-    client = HistoricDataClient()
+    client = HistoricDataClient(
+        max_requests=args.max_requests,
+        request_window_seconds=args.request_window_seconds,
+    )
+    log(
+        "Historic download: "
+        f"request throttle set to {client.max_requests} requests per {client.request_window_seconds:.1f}s."
+    )
+    if args.auto_shard:
+        log(
+            "Historic download: "
+            f"auto-shard enabled (target basket <= {float(args.target_basket_mb):.0f}MB, "
+            f"max depth {int(args.max_shard_depth)})."
+        )
+    else:
+        log("Historic download: auto-shard disabled.")
 
     manifest_path = Path(args.manifest_path or "data/historic_manifest.json")
     manifest = _load_manifest(manifest_path)
@@ -276,21 +511,7 @@ def run_download_historic(args: argparse.Namespace) -> None:
 
     def handle_window(from_date: dt.date, to_date: dt.date, plan: str) -> List[str]:
         plan_name = plan or args.plan or "Basic Plan"
-        payload = build_filter(
-            sport=args.sport,
-            plan=plan_name,
-            from_day=from_date.day,
-            from_month=from_date.month,
-            from_year=from_date.year,
-            to_day=to_date.day,
-            to_month=to_date.month,
-            to_year=to_date.year,
-            market_types=market_types,
-            countries=countries,
-            file_types=file_types,
-            event_id=args.event_id,
-            event_name=args.event_name,
-        ).to_payload()
+        payload = _build_payload(args, from_date, to_date, plan_name, market_types, countries, file_types)
 
         if args.show_options or args.show_market_types:
             options = client.get_collection_options(payload)
@@ -367,6 +588,23 @@ def run_download_historic(args: argparse.Namespace) -> None:
             return []
         return files
 
+    def iter_windows(from_date: dt.date, to_date: dt.date, plan_name: str) -> list[tuple[dt.date, dt.date]]:
+        """Return one or more windows, optionally sharded by basket size to avoid oversized API calls."""
+        if args.show_options or args.show_market_types or args.size_only or args.list_only or not args.download:
+            return [(from_date, to_date)]
+        if not args.auto_shard:
+            return [(from_date, to_date)]
+        return _plan_sharded_windows(
+            client=client,
+            args=args,
+            plan_name=plan_name,
+            from_date=from_date,
+            to_date=to_date,
+            market_types=market_types,
+            countries=countries,
+            file_types=file_types,
+        )
+
     if args.auto:
         packages = client.get_my_data(retries=args.retries, retry_wait=args.retry_wait)
         sport_filter = args.sport.lower()
@@ -408,36 +646,41 @@ def run_download_historic(args: argparse.Namespace) -> None:
             shutil.rmtree(output_dir, ignore_errors=True)
         for for_date, plan in sorted(package_months):
             from_date, to_date = _month_bounds(for_date)
-            files = handle_window(from_date, to_date, plan or args.plan or "Basic Plan")
-            if not files:
-                continue
-            log(
-                "Historic download: "
-                f"{from_date.isoformat()} to {to_date.isoformat()} ({plan})"
-            )
-            saved = _download_many(
-                client,
-                files,
-                output_dir=output_dir,
-                workers=args.workers,
-                progress_every=args.progress_every,
-                manifest=manifest,
-                force=args.force,
-                retries=args.retries,
-                retry_wait=args.retry_wait,
-            )
-            for path in saved:
-                file_path = next(
-                    (fp for fp in files if Path(fp).name == path.name), None
+            plan_name = plan or args.plan or "Basic Plan"
+            for window_from, window_to in iter_windows(from_date, to_date, plan_name):
+                files = handle_window(window_from, window_to, plan_name)
+                if not files:
+                    continue
+                log(
+                    "Historic download: "
+                    f"{window_from.isoformat()} to {window_to.isoformat()} ({plan_name})"
                 )
-                if file_path:
-                    _mark_downloaded(manifest, file_path, path)
-            if saved:
-                log("Historic download: appending to tar archive.")
-                _tar_files(output_tar, saved)
-                if not args.keep_files:
-                    for file_path in saved:
-                        file_path.unlink(missing_ok=True)
+                saved = _download_many(
+                    client,
+                    files,
+                    output_dir=output_dir,
+                    workers=args.workers,
+                    progress_every=args.progress_every,
+                    manifest=manifest,
+                    force=args.force,
+                    retries=args.retries,
+                    retry_wait=args.retry_wait,
+                    adaptive_workers=args.adaptive_workers,
+                    max_rounds=args.max_download_rounds,
+                    adaptive_cooldown=args.adaptive_cooldown,
+                )
+                file_lookup = {Path(file_path).name: file_path for file_path in files}
+                for path in saved:
+                    file_path = file_lookup.get(path.name)
+                    if file_path:
+                        _mark_downloaded(manifest, file_path, path)
+                if saved:
+                    log("Historic download: appending to tar archive.")
+                    _tar_files(output_tar, saved)
+                    if not args.keep_files:
+                        for file_path in saved:
+                            file_path.unlink(missing_ok=True)
+                _save_manifest(manifest_path, manifest)
             _save_manifest(manifest_path, manifest)
             time.sleep(0.2)
         if not args.keep_files:
@@ -457,35 +700,40 @@ def run_download_historic(args: argparse.Namespace) -> None:
     if to_date < from_date:
         raise ValueError("to-date must be on or after from-date.")
 
-    files = handle_window(from_date, to_date, plan_name)
-    if not files:
-        return
-
     output_tar = Path(args.output) if args.output else _default_output(from_date, to_date)
     _seed_manifest_from_tar(manifest, output_tar)
     output_dir = Path(args.output_dir) if args.output_dir else output_tar.with_suffix("")
     if args.clean_temp and output_dir.exists():
         log(f"Historic download: cleaning temp dir {output_dir}.")
         shutil.rmtree(output_dir, ignore_errors=True)
-    log(f"Historic download: {len(files)} files -> {output_tar}")
-    saved = _download_many(
-        client,
-        files,
-        output_dir=output_dir,
-        workers=args.workers,
-        progress_every=args.progress_every,
-        manifest=manifest,
-        force=args.force,
-        retries=args.retries,
-        retry_wait=args.retry_wait,
-    )
-    for path in saved:
-        file_path = next((fp for fp in files if Path(fp).name == path.name), None)
-        if file_path:
-            _mark_downloaded(manifest, file_path, path)
-    if saved:
-        log("Historic download: building tar archive.")
-        _tar_files(output_tar, saved)
+    windows = iter_windows(from_date, to_date, plan_name)
+    for window_from, window_to in windows:
+        files = handle_window(window_from, window_to, plan_name)
+        if not files:
+            continue
+        log(f"Historic download: {len(files)} files -> {output_tar}")
+        saved = _download_many(
+            client,
+            files,
+            output_dir=output_dir,
+            workers=args.workers,
+            progress_every=args.progress_every,
+            manifest=manifest,
+            force=args.force,
+            retries=args.retries,
+            retry_wait=args.retry_wait,
+            adaptive_workers=args.adaptive_workers,
+            max_rounds=args.max_download_rounds,
+            adaptive_cooldown=args.adaptive_cooldown,
+        )
+        file_lookup = {Path(file_path).name: file_path for file_path in files}
+        for path in saved:
+            file_path = file_lookup.get(path.name)
+            if file_path:
+                _mark_downloaded(manifest, file_path, path)
+        if saved:
+            log("Historic download: building tar archive.")
+            _tar_files(output_tar, saved)
     _save_manifest(manifest_path, manifest)
     if not args.keep_files:
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -535,12 +783,61 @@ def main() -> None:
     parser.add_argument("--keep-files", action="store_true", help="Keep downloaded files on disk.")
     parser.add_argument("--clean-temp", action="store_true", help="Remove temp download dir before starting.")
     parser.add_argument("--max-files", type=int, help="Limit number of files (useful for testing).")
-    parser.add_argument("--workers", type=int, default=None, help="Parallel download workers.")
+    parser.add_argument("--workers", type=int, default=None, help="Parallel download workers (default: auto).")
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Override request cap per window (defaults to BETFAIR_HISTORIC_MAX_REQUESTS or 90).",
+    )
+    parser.add_argument(
+        "--request-window-seconds",
+        type=float,
+        default=None,
+        help="Override rate-limit window seconds (defaults to BETFAIR_HISTORIC_REQUEST_WINDOW or 10).",
+    )
     parser.add_argument("--progress-every", type=int, default=50, help="Progress logging frequency.")
     parser.add_argument("--manifest-path", help="Path for download manifest JSON.")
     parser.add_argument("--force", action="store_true", help="Re-download files even if seen before.")
     parser.add_argument("--retries", type=int, default=5, help="Retry count for historic API failures.")
     parser.add_argument("--retry-wait", type=float, default=3.0, help="Seconds to wait between retries.")
+    parser.add_argument(
+        "--target-basket-mb",
+        type=float,
+        default=1000.0,
+        help="Shard date windows when basket size exceeds this MB threshold (set <=0 to disable).",
+    )
+    parser.add_argument(
+        "--max-shard-depth",
+        type=int,
+        default=5,
+        help="Maximum recursive split depth for oversized windows.",
+    )
+    parser.add_argument(
+        "--no-auto-shard",
+        dest="auto_shard",
+        action="store_false",
+        help="Disable automatic basket-size based date sharding.",
+    )
+    parser.add_argument(
+        "--no-adaptive-workers",
+        dest="adaptive_workers",
+        action="store_false",
+        help="Disable worker backoff when transient failures are detected.",
+    )
+    parser.add_argument(
+        "--max-download-rounds",
+        type=int,
+        default=3,
+        help="Retry rounds for transient download failures.",
+    )
+    parser.add_argument(
+        "--adaptive-cooldown",
+        type=float,
+        default=2.0,
+        help="Seconds to wait between adaptive retry rounds.",
+    )
+    parser.set_defaults(auto_shard=True, adaptive_workers=True)
     args = parser.parse_args()
     run_download_historic(args)
 

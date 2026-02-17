@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.parse
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -59,6 +61,48 @@ class HistoricFilter:
         }
 
 
+class _RequestRateLimiter:
+    """Apply a simple sliding-window cap so multi-threaded downloads do not burst into API throttles."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        """Store limits used to gate outbound historic API requests."""
+        self.max_requests = max(1, int(max_requests))
+        self.window_seconds = max(0.1, float(window_seconds))
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until the current request can proceed within the configured request budget."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                cutoff = now - self.window_seconds
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_requests:
+                    self._timestamps.append(now)
+                    return
+                wait_for = self.window_seconds - (now - self._timestamps[0]) + 0.01
+            if wait_for > 0:
+                time.sleep(min(wait_for, 0.5))
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read integer env vars with a fallback so malformed local env files do not crash startup."""
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read float env vars with a fallback so malformed local env files do not crash startup."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class HistoricDataClient:
     """Client for Betfair historic data API using SSO session tokens."""
 
@@ -69,6 +113,8 @@ class HistoricDataClient:
         password: Optional[str] = None,
         cert_file: Optional[str] = None,
         key_file: Optional[str] = None,
+        max_requests: Optional[int] = None,
+        request_window_seconds: Optional[float] = None,
     ) -> None:
         """Authenticate via Betfair SSO and prepare a session for historic API calls."""
         self.app_key = app_key or os.getenv("BETFAIR_APP_KEY")
@@ -88,7 +134,15 @@ class HistoricDataClient:
         if not all([self.app_key, self.username, self.password]):
             raise ValueError("Missing BETFAIR_APP_KEY/BETFAIR_USERNAME/BETFAIR_PASSWORD.")
         self.session = requests.Session()
-        self.historic_timeout = float(os.getenv("BETFAIR_HISTORIC_TIMEOUT", "60"))
+        self.historic_timeout = _env_float("BETFAIR_HISTORIC_TIMEOUT", 60.0)
+        # Keep a small safety margin under published limits so retry bursts stay compliant.
+        env_max_requests = _env_int("BETFAIR_HISTORIC_MAX_REQUESTS", 90)
+        env_window = _env_float("BETFAIR_HISTORIC_REQUEST_WINDOW", 10.0)
+        self.max_requests = max_requests if max_requests is not None else env_max_requests
+        self.request_window_seconds = (
+            request_window_seconds if request_window_seconds is not None else env_window
+        )
+        self._rate_limiter = _RequestRateLimiter(self.max_requests, self.request_window_seconds)
         self.ssoid = self._login()
 
     def _login(self) -> str:
@@ -108,8 +162,8 @@ class HistoricDataClient:
         data = {"username": self.username, "password": self.password}
         cert = (self.cert_file, self.key_file) if use_cert else None
         errors: List[str] = []
-        retries = int(os.getenv("BETFAIR_SSO_RETRIES", "5"))
-        retry_wait = float(os.getenv("BETFAIR_SSO_RETRY_WAIT", "3"))
+        retries = _env_int("BETFAIR_SSO_RETRIES", 5)
+        retry_wait = _env_float("BETFAIR_SSO_RETRY_WAIT", 3.0)
         for url in dict.fromkeys(urls):
             if not url:
                 continue
@@ -152,6 +206,17 @@ class HistoricDataClient:
         """Return headers required for historic data endpoints."""
         return {"ssoid": self.ssoid}
 
+    def _request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """Rate-limit requests centrally so all API calls share one throttle budget."""
+        limiter = getattr(self, "_rate_limiter", None)
+        if limiter is not None:
+            limiter.acquire()
+        request_fn = getattr(self.session, "request", None)
+        if callable(request_fn):
+            return request_fn(method, url, **kwargs)
+        fallback = getattr(self.session, method.lower())
+        return fallback(url, **kwargs)
+
     def get_my_data(
         self,
         retries: int = 3,
@@ -163,7 +228,8 @@ class HistoricDataClient:
         read_timeout = float(timeout if timeout is not None else self.historic_timeout)
         for attempt in range(1, attempts + 1):
             try:
-                resp = self.session.get(
+                resp = self._request(
+                    "GET",
                     f"{HISTORIC_BASE_URL}/GetMyData",
                     headers=self._headers(),
                     timeout=read_timeout,
@@ -184,7 +250,8 @@ class HistoricDataClient:
 
     def get_collection_options(self, filter_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Return available market/country/file filters for a given request window."""
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{HISTORIC_BASE_URL}/GetCollectionOptions",
             headers=self._headers(),
             json=filter_payload,
@@ -195,7 +262,8 @@ class HistoricDataClient:
 
     def get_basket_size(self, filter_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Return file count and total size for the given filter."""
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{HISTORIC_BASE_URL}/GetAdvBasketDataSize",
             headers=self._headers(),
             json=filter_payload,
@@ -206,7 +274,8 @@ class HistoricDataClient:
 
     def list_files(self, filter_payload: Dict[str, Any]) -> List[str]:
         """Return a list of downloadable file paths for the given filter."""
-        resp = self.session.post(
+        resp = self._request(
+            "POST",
             f"{HISTORIC_BASE_URL}/DownloadListOfFiles",
             headers=self._headers(),
             json=filter_payload,
@@ -221,7 +290,7 @@ class HistoricDataClient:
         url = f"{HISTORIC_BASE_URL}/DownloadFile?filePath={encoded}"
         for attempt in range(1, retries + 1):
             try:
-                resp = self.session.get(url, headers=self._headers(), stream=True, timeout=120)
+                resp = self._request("GET", url, headers=self._headers(), stream=True, timeout=120)
                 resp.raise_for_status()
                 with open(output_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):

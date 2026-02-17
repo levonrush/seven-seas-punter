@@ -33,6 +33,12 @@ pip install -e .
 ```
 
 ## Quick start
+One-command optimized run:
+```bash
+punter go
+```
+Use `punter <command> --help` to tune any step (`download-historic`, `pipeline`, `live`, etc.).
+
 Real historic data:
 ```bash
 punter download-historic --auto
@@ -82,6 +88,39 @@ punter live --config config/live.yaml --dry-run
 # run live with explicit safety overrides
 punter live --config config/live.yaml --live --max-stake-per-market 5 --max-daily-exposure 50
 ```
+
+## Two practical modes
+Use this when you want automatic API execution near jump time:
+```bash
+punter live --write-config config/live.yaml
+punter live --config config/live.yaml --once --dry-run
+punter live --config config/live.yaml --dry-run
+# switch to real order placement only after dry-run checks
+punter live --config config/live.yaml --live
+```
+
+Use this when you want a pub/day sheet for manual bets:
+```bash
+# pulls today's live markets and writes a shortlist CSV
+punter pub
+
+# optional: tune filters/output path
+punter pub --cutoff-minutes 10 --min-prob 0.12 --output artifacts/pub_sheet.csv
+
+# optional: allocate stakes from a day budget (fractional Kelly by default)
+punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2
+```
+
+What Kelly fraction means:
+- Kelly criterion chooses stake size to maximize expected long-run log bankroll growth.
+- Full Kelly for a back bet is `f* = (b*p - q)/b`, where:
+  - `p` is model win probability
+  - `q = 1 - p`
+  - `b = (odds - 1) * (1 - commission)` is net odds
+- `kelly_fraction` scales full Kelly to reduce risk: `f = kelly_fraction * max(0, f*)`.
+- Example: if full Kelly suggests `8%` and `kelly_fraction=0.25`, the stake is `2%` of budget.
+- This project applies Kelly only when you provide a daily `--budget` to `punter pub`/`punter score`.
+- Full theory and assumptions are in `shared/backtest/README.md`.
 
 ## Where to look next
 - Workflow usage and CLI examples: `workflow/README.md`

@@ -6,6 +6,7 @@ import uuid
 
 import pandas as pd
 
+from shared.backtest.allocation import allocate_stakes_from_budget, summarize_budget_usage
 from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
@@ -15,6 +16,7 @@ from shared.model.market_type import bucket_market_type
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
+from shared.utils.cli_presets import go_historic_args, go_pipeline_args
 from shared.utils.progress import log
 from workflow.ingest_archive import ingest_archive_file
 
@@ -564,6 +566,37 @@ def cmd_score(args: argparse.Namespace) -> None:
         .reset_index(drop=True)
     )
 
+    best["price"] = best.get(price_col)
+    budget = getattr(args, "budget", None)
+    if budget is not None:
+        if float(budget) <= 0:
+            raise ValueError("--budget must be > 0.")
+        best = allocate_stakes_from_budget(
+            best,
+            budget=float(budget),
+            commission=0.05,
+            method=str(getattr(args, "allocation_method", "fractional_kelly")),
+            kelly_fraction=float(getattr(args, "kelly_fraction", 0.25)),
+            max_bet_pct=float(getattr(args, "max_bet_pct", 0.2)),
+        )
+        before = len(best)
+        best = best[best["suggested_stake"] > 0].copy()
+        log(f"Score: budget allocation kept {len(best)}/{before} rows with non-zero stake.")
+        used, remaining = summarize_budget_usage(best, float(budget))
+        log(
+            "Score: "
+            f"allocated {used:.2f}/{float(budget):.2f} budget; "
+            f"remaining={remaining:.2f}."
+        )
+    else:
+        best["suggested_stake"] = 1.0
+        best["allocation_method"] = "flat"
+        best["kelly_fraction_full"] = None
+        best["stake_fraction"] = None
+    if best.empty:
+        log("Score: no candidates received a positive suggested stake.")
+        return
+
     output_rows = []
     for _, row in best.iterrows():
         output_rows.append(
@@ -577,7 +610,10 @@ def cmd_score(args: argparse.Namespace) -> None:
                 "price": row.get(price_col),
                 "p_hat": row["p_hat"],
                 "expected_value": row["ev"],
-                "suggested_stake": 1.0,
+                "suggested_stake": row.get("suggested_stake", 1.0),
+                "stake_fraction": row.get("stake_fraction"),
+                "allocation_method": row.get("allocation_method"),
+                "kelly_fraction_full": row.get("kelly_fraction_full"),
                 "notes": "dry-run" if client.dry_run else "",
             }
         )
@@ -589,6 +625,18 @@ def cmd_score(args: argparse.Namespace) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
     log(f"Wrote {len(df)} opportunities to {output_path}")
+
+
+def cmd_pub(args: argparse.Namespace) -> None:
+    """Generate a manual-betting day sheet from live Betfair prices without placing any orders.
+
+    Why: provide a simple pub-friendly entrypoint so users can get today's shortlist without
+    remembering the full `score` command flags.
+    """
+    if not getattr(args, "output", None):
+        args.output = f"artifacts/pub_sheet_{dt.date.today().isoformat()}.csv"
+    log(f"Pub sheet: writing to {args.output}")
+    cmd_score(args)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -764,6 +812,25 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     log("Pipeline complete.")
 
 
+def cmd_go(_args: argparse.Namespace) -> None:
+    """Run the default optimized end-to-end flow with no tuning flags required.
+
+    Why: provide a single CLI command for users who want the recommended path without
+    memorizing command options. Advanced users can still tune each subcommand directly.
+    """
+    parser = build_parser()
+
+    historic_tokens = ["download-historic", *go_historic_args()]
+    log(f"Go: running `punter {' '.join(historic_tokens)}`")
+    historic_args = parser.parse_args(historic_tokens)
+    historic_args.func(historic_args)
+
+    pipeline_tokens = ["pipeline", *go_pipeline_args()]
+    log(f"Go: running `punter {' '.join(pipeline_tokens)}`")
+    pipeline_args = parser.parse_args(pipeline_tokens)
+    pipeline_args.func(pipeline_args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI parser with subcommands."""
     parser = argparse.ArgumentParser(description="Seven Seas Punter pipeline CLI")
@@ -832,12 +899,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_hist.add_argument("--keep-files", action="store_true", help="Keep downloaded files on disk.")
     p_hist.add_argument("--clean-temp", action="store_true", help="Remove temp download dir before starting.")
     p_hist.add_argument("--max-files", type=int, help="Limit number of files (useful for testing).")
-    p_hist.add_argument("--workers", type=int, default=None, help="Parallel download workers (default 1).")
+    p_hist.add_argument("--workers", type=int, default=None, help="Parallel download workers (default: auto).")
+    p_hist.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Override request cap per window (defaults to BETFAIR_HISTORIC_MAX_REQUESTS or 90).",
+    )
+    p_hist.add_argument(
+        "--request-window-seconds",
+        type=float,
+        default=None,
+        help="Override rate-limit window seconds (defaults to BETFAIR_HISTORIC_REQUEST_WINDOW or 10).",
+    )
     p_hist.add_argument("--progress-every", type=int, default=50, help="Progress logging frequency.")
     p_hist.add_argument("--manifest-path", help="Path for download manifest JSON.")
     p_hist.add_argument("--force", action="store_true", help="Re-download files even if seen before.")
     p_hist.add_argument("--retries", type=int, default=5, help="Retry count for historic API failures.")
     p_hist.add_argument("--retry-wait", type=float, default=3.0, help="Seconds to wait between retries.")
+    p_hist.add_argument(
+        "--target-basket-mb",
+        type=float,
+        default=1000.0,
+        help="Shard date windows when basket size exceeds this MB threshold (set <=0 to disable).",
+    )
+    p_hist.add_argument(
+        "--max-shard-depth",
+        type=int,
+        default=5,
+        help="Maximum recursive split depth for oversized windows.",
+    )
+    p_hist.add_argument(
+        "--no-auto-shard",
+        dest="auto_shard",
+        action="store_false",
+        help="Disable automatic basket-size based date sharding.",
+    )
+    p_hist.add_argument(
+        "--no-adaptive-workers",
+        dest="adaptive_workers",
+        action="store_false",
+        help="Disable worker backoff when transient failures are detected.",
+    )
+    p_hist.add_argument("--max-download-rounds", type=int, default=3, help="Retry rounds for transient failures.")
+    p_hist.add_argument("--adaptive-cooldown", type=float, default=2.0, help="Seconds to wait between rounds.")
+    p_hist.set_defaults(auto_shard=True, adaptive_workers=True)
     p_hist.set_defaults(func=cmd_download_historic)
 
     p_feat = sub.add_parser("features", help="Build features at cutoff")
@@ -1012,7 +1118,63 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
     )
+    p_score.add_argument("--budget", type=float, help="Optional day budget for stake allocation.")
+    p_score.add_argument(
+        "--allocation-method",
+        choices=["fractional_kelly", "equal"],
+        default="fractional_kelly",
+        help="Stake allocation method when --budget is set.",
+    )
+    p_score.add_argument(
+        "--kelly-fraction",
+        type=float,
+        default=0.25,
+        help="Fractional Kelly multiplier (used by fractional_kelly method).",
+    )
+    p_score.add_argument(
+        "--max-bet-pct",
+        type=float,
+        default=0.2,
+        help="Max stake per bet as a fraction of daily budget.",
+    )
     p_score.set_defaults(func=cmd_score)
+
+    p_pub = sub.add_parser(
+        "pub",
+        aliases=["sheet"],
+        help="Create today's manual betting sheet from live markets (no auto execution).",
+    )
+    p_pub.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
+    p_pub.add_argument("--dry-run", action="store_true", help="Use mock data even if credentials exist.")
+    p_pub.add_argument(
+        "--output",
+        help="Output CSV path (defaults to artifacts/pub_sheet_<YYYY-MM-DD>.csv).",
+    )
+    p_pub.add_argument(
+        "--min-prob",
+        type=float,
+        help="Optional min probability to include in the pub sheet.",
+    )
+    p_pub.add_argument("--budget", type=float, help="Optional day budget for stake allocation.")
+    p_pub.add_argument(
+        "--allocation-method",
+        choices=["fractional_kelly", "equal"],
+        default="fractional_kelly",
+        help="Stake allocation method when --budget is set.",
+    )
+    p_pub.add_argument(
+        "--kelly-fraction",
+        type=float,
+        default=0.25,
+        help="Fractional Kelly multiplier (used by fractional_kelly method).",
+    )
+    p_pub.add_argument(
+        "--max-bet-pct",
+        type=float,
+        default=0.2,
+        help="Max stake per bet as a fraction of daily budget.",
+    )
+    p_pub.set_defaults(func=cmd_pub)
 
     p_live = sub.add_parser(
         "live",
@@ -1240,6 +1402,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--skip-backtest", action="store_true")
     p_pipe.add_argument("--skip-score", action="store_true")
     p_pipe.set_defaults(func=cmd_pipeline)
+
+    p_go = sub.add_parser(
+        "go",
+        aliases=["auto"],
+        help="Run the default optimized flow (historic download -> incremental pipeline).",
+    )
+    p_go.set_defaults(func=cmd_go)
 
     p_qs = sub.add_parser("quickstart", help="Run a dry-run end-to-end using mock download data")
     p_qs.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])

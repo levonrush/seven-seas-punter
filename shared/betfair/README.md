@@ -18,6 +18,8 @@ Optional SSO overrides and retries:
 - `BETFAIR_SSO_RETRIES`
 - `BETFAIR_SSO_RETRY_WAIT`
 - `BETFAIR_HISTORIC_TIMEOUT` (seconds for historic API reads, default `60`)
+- `BETFAIR_HISTORIC_MAX_REQUESTS` (historic API requests per window, default `90`)
+- `BETFAIR_HISTORIC_REQUEST_WINDOW` (seconds for the request window, default `10`)
 
 ## Files
 - `client.py`: lightweight wrapper used by workflow scoring.
