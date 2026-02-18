@@ -2,6 +2,8 @@
 
 CLI entrypoints live here. These scripts are thin wrappers around the shared library in `shared/`.
 
+Canonical CLI runbook: `docs/cli_playbook.md`.
+
 ## Common flows
 
 One-command optimized run (recommended default):
@@ -70,28 +72,17 @@ Automatic API execution (near jump):
 ```bash
 punter live --write-config config/live.yaml
 punter live --config config/live.yaml --once --dry-run
-punter live --config config/live.yaml --dry-run
 punter live --config config/live.yaml --live
-punter live --config config/live.yaml --market-types WIN,PLACE
 ```
 
 Manual day sheet (pub mode):
 ```bash
 punter pub
-punter pub --min-prob 0.12 --output artifacts/pub_sheet.csv
 punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2
-punter pub --market-types WIN,EXACTA
-punter pub --tab-translation-model artifacts/tab_translation_cutoff_10.joblib
-punter pub --tab-odds-quantile 0.15
-punter pub --execution-domain betfair
 ```
 
-Pub-mode theory (domain adaptation):
-- `punter pub` now defaults to `--execution-domain tab`.
-- Outcome probabilities still come from Betfair features (`p_hat`).
-- Price decisioning is translated into a TAB odds distribution (`tab_price_q10/q50/q90`) and EV uses a conservative quantile (`--tab-odds-quantile`, default `0.10`).
-- If no TAB model is available, a conservative haircut fallback is used so the CLI remains one-command operational.
-- Result: shortlist and stake sizing are less sensitive to Betfair→TAB slippage risk.
+Pub-mode theory and advanced flags live in `docs/pub_domain_adaptation.md`.
+Full command recipes live in `docs/cli_playbook.md`.
 
 Kelly fraction (brief):
 - Kelly is a bankroll-growth stake formula based on probability and net odds.

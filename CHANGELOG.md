@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Removed inlined Kelly/staking derivation from top-level README and made root docs more navigation-first with explicit links to focused docs.
+- Added a docs hub (`docs/README.md`) and split CLI runbook/theory into focused pages (`docs/cli_playbook.md`, `docs/pub_domain_adaptation.md`) to reduce README duplication.
+- Slimmed top-level and workflow READMEs to be navigation-first, with deeper operational/theory content linked from docs.
 - Added TAB-aware domain adaptation for `punter pub`: conservative TAB odds quantiles (`q10/q50/q90`), fallback haircut pricing, and EV/stake sizing on the translated execution domain.
 - Added shared TAB translation utilities (`shared/model/tab_translation.py`) with optional joblib model bundles and quantile interpolation support.
 - Added CLI flags for score/pub execution-domain control: `--execution-domain`, `--tab-translation-model`, `--tab-odds-quantile`, `--tab-fallback-haircut`, and `--tab-fallback-spread`.
