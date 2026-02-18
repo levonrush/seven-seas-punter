@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added `config/README.md` with `live.yaml` usage and safe editing guidance for `punter live` configuration.
 - Removed inlined Kelly/staking derivation from top-level README and made root docs more navigation-first with explicit links to focused docs.
 - Added a docs hub (`docs/README.md`) and split CLI runbook/theory into focused pages (`docs/cli_playbook.md`, `docs/pub_domain_adaptation.md`) to reduce README duplication.
 - Slimmed top-level and workflow READMEs to be navigation-first, with deeper operational/theory content linked from docs.

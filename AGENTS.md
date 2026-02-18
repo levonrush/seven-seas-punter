@@ -31,6 +31,15 @@ This file is guidance for automated agents working in this repository.
 ## Changelog
 - Update `CHANGELOG.md` for any code changes.
 
+## Documentation navigation
+- Treat `README.md` as a concise entrypoint (quick start + links), not a full runbook.
+- Use `docs/README.md` as the docs index before editing docs.
+- Put command-heavy operational guidance in `docs/cli_playbook.md`.
+- Put pub-mode domain-adaptation theory in `docs/pub_domain_adaptation.md`.
+- Keep workflow-specific CLI surface notes in `workflow/README.md`.
+- Keep module internals in module READMEs under `shared/**/README.md`.
+- When adding new docs, add links from `docs/README.md` and keep cross-links up to date.
+
 ## Common commands
 - Download data: `punter download-historic --auto`.
 - Ingest: `punter ingest --archive data/data.tar`.
