@@ -50,7 +50,7 @@ Pub/manual betting sheet from live markets:
 punter pub
 ```
 
-Current operational scope (February 17, 2026):
+Current operational scope (February 18, 2026):
 - Live and pub flows default to ALL market types.
 - Country defaults remain AU.
 - Modeling quality is strongest on WIN-style markets; broader market types are supported but less validated.
@@ -81,7 +81,17 @@ punter pub
 punter pub --min-prob 0.12 --output artifacts/pub_sheet.csv
 punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2
 punter pub --market-types WIN,EXACTA
+punter pub --tab-translation-model artifacts/tab_translation_cutoff_10.joblib
+punter pub --tab-odds-quantile 0.15
+punter pub --execution-domain betfair
 ```
+
+Pub-mode theory (domain adaptation):
+- `punter pub` now defaults to `--execution-domain tab`.
+- Outcome probabilities still come from Betfair features (`p_hat`).
+- Price decisioning is translated into a TAB odds distribution (`tab_price_q10/q50/q90`) and EV uses a conservative quantile (`--tab-odds-quantile`, default `0.10`).
+- If no TAB model is available, a conservative haircut fallback is used so the CLI remains one-command operational.
+- Result: shortlist and stake sizing are less sensitive to Betfair→TAB slippage risk.
 
 Kelly fraction (brief):
 - Kelly is a bankroll-growth stake formula based on probability and net odds.

@@ -3,6 +3,10 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added TAB-aware domain adaptation for `punter pub`: conservative TAB odds quantiles (`q10/q50/q90`), fallback haircut pricing, and EV/stake sizing on the translated execution domain.
+- Added shared TAB translation utilities (`shared/model/tab_translation.py`) with optional joblib model bundles and quantile interpolation support.
+- Added CLI flags for score/pub execution-domain control: `--execution-domain`, `--tab-translation-model`, `--tab-odds-quantile`, `--tab-fallback-haircut`, and `--tab-fallback-spread`.
+- Added DuckDB tables and store helpers for manual TAB capture (`tab_quotes`, `tab_executions`) to support active-label collection for translation models.
 - Added automatic DuckDB schema recovery with backup on failure.
 - Added elapsed-time logging across workflow steps and shared modules.
 - Defaulted ingest filters to AU horse racing WIN markets to reduce data volume.

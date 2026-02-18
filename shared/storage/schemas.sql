@@ -74,6 +74,29 @@ CREATE TABLE IF NOT EXISTS oof_predictions (
     p_hat DOUBLE
 );
 
+CREATE TABLE IF NOT EXISTS tab_quotes (
+    market_id TEXT,
+    selection_id BIGINT,
+    quote_time TIMESTAMP,
+    source_channel TEXT,
+    product_type TEXT,
+    display_odds DOUBLE,
+    notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tab_executions (
+    market_id TEXT,
+    selection_id BIGINT,
+    placed_time TIMESTAMP,
+    source_channel TEXT,
+    product_type TEXT,
+    stake DOUBLE,
+    accepted_odds DOUBLE,
+    was_repriced BOOLEAN,
+    was_refused BOOLEAN,
+    notes TEXT
+);
+
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS market_type TEXT;
 ALTER TABLE bets ADD COLUMN IF NOT EXISTS run_id TEXT;
 ALTER TABLE model_runs ADD COLUMN IF NOT EXISTS run_id TEXT;

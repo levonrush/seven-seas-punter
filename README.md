@@ -12,7 +12,7 @@ Pipeline for Betfair Exchange horse racing: download markets, snapshot odds, bui
 - Backtest value strategies with commission and basic execution filters.
 - Score “today” (or dry-run) and export a CSV of opportunities.
 
-## Current scope (February 17, 2026)
+## Current scope (February 18, 2026)
 - Live and pub scoring paths now default to ALL market types unless you set a filter.
 - Country defaults are still AU across most commands.
 - The project is most battle-tested on horse-racing WIN-style modeling; non-WIN market coverage is available but less validated.
@@ -108,17 +108,43 @@ punter live --config config/live.yaml --market-types WIN,PLACE
 
 Use this when you want a pub/day sheet for manual bets:
 ```bash
-# pulls today's live markets and writes a shortlist CSV
+# easiest path: TAB-first conservative shortlist
 punter pub
 
-# optional: tune filters/output path
-punter pub --cutoff-minutes 10 --min-prob 0.12 --output artifacts/pub_sheet.csv
-# optional market-type filter (default is ALL)
-punter pub --market-types WIN,EXACTA
+# write to a specific file and tighten probability filter
+punter pub --min-prob 0.12 --output artifacts/pub_sheet.csv
 
-# optional: allocate stakes from a day budget (fractional Kelly by default)
+# add bankroll sizing (fractional Kelly by default)
 punter pub --budget 100 --kelly-fraction 0.25 --max-bet-pct 0.2
+
+# optional: use a trained TAB translation model if you have one
+punter pub --tab-translation-model artifacts/tab_translation_cutoff_10.joblib
+
+# optional: change conservatism (default uses TAB q10 odds)
+punter pub --tab-odds-quantile 0.15
+
+# optional: legacy exchange-style pricing
+punter pub --execution-domain betfair
 ```
+
+Pub-mode output now includes:
+- `execution_domain`: whether EV was computed in `tab` or `betfair` mode.
+- `price`: the decision price used for EV and stake sizing.
+- `betfair_price`: the source exchange price.
+- `tab_price_q10/q50/q90`: TAB translated odds bands (or blank in betfair mode).
+- `tab_price_source`: whether TAB pricing came from a trained model or conservative fallback.
+
+### Why this works (theory)
+- The app now treats manual TAB execution as a domain adaptation problem: your probability model is trained from Betfair states, but execution happens in a different price-formation domain (TAB).
+- `punter pub` separates the decision into two parts:
+  - outcome model: `p_hat` from Betfair features.
+  - price translation: estimate a distribution of executable TAB odds.
+- Decision rule is conservative by default:
+  - estimate TAB odds quantiles (`q10/q50/q90`).
+  - compute EV using a lower quantile (default `q10`), not the optimistic point quote.
+  - only shortlist bets that stay positive under that conservative assumption.
+- If no TAB translation model exists yet, pub mode uses a built-in haircut fallback from Betfair odds so the CLI remains one-command usable while you collect manual TAB labels.
+- This matches the literature strategy: partial observability, conservative EV under price uncertainty, and progressive improvement as TAB labels accumulate.
 
 What Kelly fraction means:
 - Kelly criterion chooses stake size to maximize expected long-run log bankroll growth.

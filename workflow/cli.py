@@ -12,6 +12,7 @@ from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.predictions import build_prediction_preview
+from shared.model.tab_translation import estimate_tab_odds_quantiles, quantile_to_column
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
@@ -301,6 +302,37 @@ def _load_oof_predictions_for_backtest(
     return features, probs
 
 
+def _select_score_price(feature_row: pd.Series, cutoff_minutes: int) -> float | None:
+    """Pick a usable Betfair price for scoring so sparse offsets do not drop otherwise valid rows."""
+    candidate = feature_row.get(f"back_price_t{cutoff_minutes}")
+    if pd.notnull(candidate):
+        return float(candidate)
+    for offset in [60, 30, 10, 5, 2, 1]:
+        fallback = feature_row.get(f"back_price_t{offset}")
+        if pd.notnull(fallback):
+            return float(fallback)
+    return None
+
+
+def _resolve_execution_domain(args: argparse.Namespace) -> str:
+    """Resolve scoring domain defaults so pub can stay TAB-first while score stays Betfair-first."""
+    explicit = getattr(args, "execution_domain", None)
+    if explicit is not None:
+        return str(explicit).strip().lower()
+    command = str(getattr(args, "command", "")).strip().lower()
+    if command in {"pub", "sheet"}:
+        return "tab"
+    return "betfair"
+
+
+def _parse_tab_quantile(raw_value: float | None) -> float:
+    """Validate TAB decision quantile so conservative EV gating always uses a valid probability quantile."""
+    quantile = 0.10 if raw_value is None else float(raw_value)
+    if quantile <= 0.0 or quantile >= 1.0:
+        raise ValueError("--tab-odds-quantile must be between 0 and 1 (exclusive).")
+    return quantile
+
+
 def cmd_features(args: argparse.Namespace) -> None:
     """Build features at a cutoff minute and save Parquet."""
     print(f"Building features (cutoff T-{args.cutoff_minutes})...")
@@ -514,10 +546,19 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 def cmd_score(args: argparse.Namespace) -> None:
     """Score today's markets and write CSV report."""
     print(f"Scoring today (cutoff T-{args.cutoff_minutes})...")
-    import pandas as pd
+    from shared.backtest.engine import compute_expected_value
     from workflow.score_today import _capture_latest_snapshots
 
     today = dt.date.today()
+    execution_domain = _resolve_execution_domain(args)
+    if execution_domain not in {"betfair", "tab"}:
+        raise ValueError("--execution-domain must be either 'betfair' or 'tab'.")
+    tab_decision_quantile = _parse_tab_quantile(getattr(args, "tab_odds_quantile", None))
+    tab_decision_column = quantile_to_column(tab_decision_quantile)
+    tab_model_path = getattr(args, "tab_translation_model", None)
+    tab_fallback_haircut = float(getattr(args, "tab_fallback_haircut", 0.08))
+    tab_fallback_spread = float(getattr(args, "tab_fallback_spread", 0.10))
+
     market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
     selected = tokens_to_filter_set(market_tokens)
     client = BetfairClient()
@@ -556,8 +597,6 @@ def cmd_score(args: argparse.Namespace) -> None:
         implied = 1 / features[price_col]
         probs = implied.fillna(implied.mean())
 
-    from shared.backtest.engine import compute_expected_value
-
     features["p_hat"] = probs
     min_prob = _resolve_min_prob(args, store)
     if min_prob is not None:
@@ -567,10 +606,57 @@ def cmd_score(args: argparse.Namespace) -> None:
         if features.empty:
             log("No rows remain after min_prob filter.")
             return
-    price_col = f"back_price_t{args.cutoff_minutes}"
+    features["betfair_price"] = features.apply(
+        lambda row: _select_score_price(row, args.cutoff_minutes),
+        axis=1,
+    )
+    before_price = len(features)
+    features = features[features["betfair_price"].notna()].copy()
+    features = features[features["betfair_price"] > 0].copy()
+    if features.empty:
+        log(f"Score: no rows with a usable price ({len(features)}/{before_price} rows).")
+        return
+
+    tab_q10_col = quantile_to_column(0.10)
+    tab_q50_col = quantile_to_column(0.50)
+    tab_q90_col = quantile_to_column(0.90)
+    commission_rate = 0.05
+    if execution_domain == "tab":
+        tab_prices = estimate_tab_odds_quantiles(
+            feature_df=features,
+            cutoff_minutes=args.cutoff_minutes,
+            quantiles=[0.10, 0.50, 0.90, tab_decision_quantile],
+            model_path=tab_model_path,
+            fallback_haircut=tab_fallback_haircut,
+            fallback_spread=tab_fallback_spread,
+        )
+        features = features.join(tab_prices)
+        features["decision_price"] = features.get(tab_decision_column)
+        commission_rate = 0.0
+        log(
+            "Score: "
+            f"execution-domain=tab, decision-quantile={tab_decision_quantile:.2f}, "
+            f"model={tab_model_path or 'fallback-only'}."
+        )
+    else:
+        features["decision_price"] = features["betfair_price"]
+        features["tab_price_source"] = "betfair"
+        features[tab_q10_col] = pd.NA
+        features[tab_q50_col] = pd.NA
+        features[tab_q90_col] = pd.NA
+
+    before_decision = len(features)
+    features = features[features["decision_price"].notna()].copy()
+    features = features[features["decision_price"] > 0].copy()
+    if features.empty:
+        log(f"Score: no rows with decision prices ({len(features)}/{before_decision} rows).")
+        return
+
     features["ev"] = features.apply(
-        lambda r: compute_expected_value(
-            prob=r["p_hat"], price=r.get(price_col) or r.get("back_price_t10") or 0.0
+        lambda row: compute_expected_value(
+            prob=float(row["p_hat"]),
+            price=float(row["decision_price"]),
+            commission=commission_rate,
         ),
         axis=1,
     )
@@ -586,7 +672,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         .reset_index(drop=True)
     )
 
-    best["price"] = best.get(price_col)
+    best["price"] = best.get("decision_price")
     budget = getattr(args, "budget", None)
     if budget is not None:
         if float(budget) <= 0:
@@ -594,7 +680,7 @@ def cmd_score(args: argparse.Namespace) -> None:
         best = allocate_stakes_from_budget(
             best,
             budget=float(budget),
-            commission=0.05,
+            commission=commission_rate,
             method=str(getattr(args, "allocation_method", "fractional_kelly")),
             kelly_fraction=float(getattr(args, "kelly_fraction", 0.25)),
             max_bet_pct=float(getattr(args, "max_bet_pct", 0.2)),
@@ -627,9 +713,17 @@ def cmd_score(args: argparse.Namespace) -> None:
                 "market_id": row["market_id"],
                 "selection": row.get("runner_name", row["selection_id"]),
                 "bet_type": "WIN",
-                "price": row.get(price_col),
+                "execution_domain": execution_domain,
+                "price": row.get("decision_price"),
+                "betfair_price": row.get("betfair_price"),
+                "tab_decision_quantile": tab_decision_quantile if execution_domain == "tab" else None,
+                "tab_price_source": row.get("tab_price_source"),
+                "tab_price_q10": row.get(tab_q10_col),
+                "tab_price_q50": row.get(tab_q50_col),
+                "tab_price_q90": row.get(tab_q90_col),
                 "p_hat": row["p_hat"],
                 "expected_value": row["ev"],
+                "commission_rate": commission_rate,
                 "suggested_stake": row.get("suggested_stake", 1.0),
                 "stake_fraction": row.get("stake_fraction"),
                 "allocation_method": row.get("allocation_method"),
@@ -648,14 +742,33 @@ def cmd_score(args: argparse.Namespace) -> None:
 
 
 def cmd_pub(args: argparse.Namespace) -> None:
-    """Generate a manual-betting day sheet from live Betfair prices without placing any orders.
+    """Generate a TAB-focused manual-betting day sheet with conservative domain-adapted pricing.
 
-    Why: provide a simple pub-friendly entrypoint so users can get today's shortlist without
-    remembering the full `score` command flags.
+    Why: pub mode targets manual TAB execution, so it defaults to conservative TAB pricing assumptions
+    while keeping CLI usage simple for everyday operation.
     """
+    if not getattr(args, "command", None):
+        args.command = "pub"
+    if getattr(args, "execution_domain", None) is None:
+        args.execution_domain = "tab"
+    if getattr(args, "tab_odds_quantile", None) is None:
+        args.tab_odds_quantile = 0.10
+    if getattr(args, "tab_fallback_haircut", None) is None:
+        args.tab_fallback_haircut = 0.08
+    if getattr(args, "tab_fallback_spread", None) is None:
+        args.tab_fallback_spread = 0.10
+    if getattr(args, "tab_translation_model", None) is None:
+        default_model = pathlib.Path(f"artifacts/tab_translation_cutoff_{args.cutoff_minutes}.joblib")
+        if default_model.exists():
+            args.tab_translation_model = str(default_model)
+
     if not getattr(args, "output", None):
         args.output = f"artifacts/pub_sheet_{dt.date.today().isoformat()}.csv"
-    log(f"Pub sheet: writing to {args.output}")
+    log(
+        "Pub sheet: "
+        f"writing to {args.output} "
+        f"(execution-domain={args.execution_domain}, q={float(args.tab_odds_quantile):.2f})."
+    )
     cmd_score(args)
 
 
@@ -663,7 +776,16 @@ def cmd_status(args: argparse.Namespace) -> None:
     """Print simple row counts for sanity checks."""
     store = DuckDBStore()
     with store._connect() as con:  # type: ignore[attr-defined]
-        tables = ["markets", "runners", "snapshots", "results", "bets", "model_runs"]
+        tables = [
+            "markets",
+            "runners",
+            "snapshots",
+            "results",
+            "bets",
+            "model_runs",
+            "tab_quotes",
+            "tab_executions",
+        ]
         counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
     log(f"DB counts: {counts}")
 
@@ -849,6 +971,47 @@ def cmd_go(_args: argparse.Namespace) -> None:
     log(f"Go: running `punter {' '.join(pipeline_tokens)}`")
     pipeline_args = parser.parse_args(pipeline_tokens)
     pipeline_args.func(pipeline_args)
+
+
+def _add_execution_domain_arguments(
+    parser: argparse.ArgumentParser,
+    default_execution_domain: str,
+) -> None:
+    """Attach domain-adaptation flags so pub/score can share one consistent TAB pricing interface."""
+    parser.add_argument(
+        "--execution-domain",
+        choices=["betfair", "tab"],
+        default=default_execution_domain,
+        help=(
+            "Price domain used for EV and stake sizing. "
+            "Use tab for manual TAB execution and betfair for exchange-style scoring."
+        ),
+    )
+    parser.add_argument(
+        "--tab-translation-model",
+        help=(
+            "Optional path to a TAB translation model bundle. "
+            "If omitted or missing, pub mode uses a conservative haircut fallback."
+        ),
+    )
+    parser.add_argument(
+        "--tab-odds-quantile",
+        type=float,
+        default=0.10,
+        help="Conservative TAB odds quantile used for EV gating when --execution-domain=tab.",
+    )
+    parser.add_argument(
+        "--tab-fallback-haircut",
+        type=float,
+        default=0.08,
+        help="Fallback percentage haircut vs Betfair odds when TAB translation model is unavailable.",
+    )
+    parser.add_argument(
+        "--tab-fallback-spread",
+        type=float,
+        default=0.10,
+        help="Fallback uncertainty spread used to derive TAB odds quantile bands around the median.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1172,6 +1335,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_execution_domain_arguments(p_score, default_execution_domain="betfair")
     p_score.set_defaults(func=cmd_score)
 
     p_pub = sub.add_parser(
@@ -1214,6 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_execution_domain_arguments(p_pub, default_execution_domain="tab")
     p_pub.set_defaults(func=cmd_pub)
 
     p_live = sub.add_parser(

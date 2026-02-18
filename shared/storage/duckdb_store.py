@@ -290,6 +290,92 @@ class DuckDBStore:
                 [run_id, cutoff_minutes],
             ).df()
 
+    def append_tab_quotes(self, quotes: Iterable[Dict[str, Any]]) -> None:
+        """Persist manually captured TAB display quotes so translation models can learn executable odds drift."""
+        df = pd.DataFrame(list(quotes))
+        if df.empty:
+            return
+        cols = [
+            "market_id",
+            "selection_id",
+            "quote_time",
+            "source_channel",
+            "product_type",
+            "display_odds",
+            "notes",
+        ]
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        df = df[cols]
+        with self._connect() as con:
+            con.register("df", df)
+            con.execute(
+                """
+                INSERT INTO tab_quotes (
+                    market_id,
+                    selection_id,
+                    quote_time,
+                    source_channel,
+                    product_type,
+                    display_odds,
+                    notes
+                )
+                SELECT * FROM df
+                """
+            )
+
+    def append_tab_executions(self, executions: Iterable[Dict[str, Any]]) -> None:
+        """Persist accepted/repriced/refused TAB execution outcomes for settlement and translation supervision."""
+        df = pd.DataFrame(list(executions))
+        if df.empty:
+            return
+        cols = [
+            "market_id",
+            "selection_id",
+            "placed_time",
+            "source_channel",
+            "product_type",
+            "stake",
+            "accepted_odds",
+            "was_repriced",
+            "was_refused",
+            "notes",
+        ]
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        df = df[cols]
+        with self._connect() as con:
+            con.register("df", df)
+            con.execute(
+                """
+                INSERT INTO tab_executions (
+                    market_id,
+                    selection_id,
+                    placed_time,
+                    source_channel,
+                    product_type,
+                    stake,
+                    accepted_odds,
+                    was_repriced,
+                    was_refused,
+                    notes
+                )
+                SELECT * FROM df
+                """
+            )
+
+    def load_tab_quotes(self) -> pd.DataFrame:
+        """Load captured TAB display quotes so translation model training can reuse persisted manual labels."""
+        with self._connect() as con:
+            return con.execute("SELECT * FROM tab_quotes").df()
+
+    def load_tab_executions(self) -> pd.DataFrame:
+        """Load TAB execution outcomes so realised slippage and refusal rates can be monitored over time."""
+        with self._connect() as con:
+            return con.execute("SELECT * FROM tab_executions").df()
+
     def load_snapshots(self) -> pd.DataFrame:
         """Return all stored snapshots for downstream feature construction."""
         with self._connect() as con:
