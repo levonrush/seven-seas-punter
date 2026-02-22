@@ -99,19 +99,23 @@ def split_features_by_race_time(
 
 def build_features_from_store(store, cutoff_minutes: int) -> pd.DataFrame:
     """Construct leakage-safe features using only snapshots strictly before the cutoff."""
-    snapshots = store.load_snapshots()
+    if hasattr(store, "load_snapshots_for_cutoff"):
+        snapshots = store.load_snapshots_for_cutoff(cutoff_minutes)
+    else:
+        snapshots = store.load_snapshots()
     if snapshots.empty:
         log("Features: no snapshots found; returning empty frame.")
         return pd.DataFrame()
     log(f"Features: loaded {len(snapshots)} snapshots.")
-    snapshots = snapshots.dropna(subset=["snapshot_time", "race_start_time"])
-    snapshots = snapshots[snapshots["snapshot_time"] < snapshots["race_start_time"]]
-    snapshots = snapshots[snapshots["seconds_to_start"] >= cutoff_minutes * 60].copy()
+    if not hasattr(store, "load_snapshots_for_cutoff"):
+        snapshots = snapshots.dropna(subset=["snapshot_time", "race_start_time"])
+        snapshots = snapshots[snapshots["snapshot_time"] < snapshots["race_start_time"]]
+        snapshots = snapshots[snapshots["seconds_to_start"] >= cutoff_minutes * 60].copy()
     if snapshots.empty:
         log(f"Features: no snapshots at/after cutoff T-{cutoff_minutes}; returning empty frame.")
         return pd.DataFrame()
     log(f"Features: {len(snapshots)} snapshots after cutoff filter (T-{cutoff_minutes}).")
-    if hasattr(store, "load_markets"):
+    if hasattr(store, "load_markets") and "market_type" not in snapshots.columns:
         markets = store.load_markets()
         if not markets.empty and "market_type" in markets.columns:
             snapshots = snapshots.merge(
@@ -122,7 +126,12 @@ def build_features_from_store(store, cutoff_minutes: int) -> pd.DataFrame:
 
     valid_offsets = _valid_offsets(cutoff_minutes)
     features = []
-    for (market_id, selection_id), runner_df in snapshots.groupby(["market_id", "selection_id"]):
+    for (market_id, selection_id), runner_df in snapshots.groupby(["market_id", "selection_id"], sort=False):
+        runner_df_sorted = runner_df.sort_values("seconds_to_start")
+        offset_rows: dict[int, pd.Series | None] = {}
+        for offset in valid_offsets:
+            eligible = runner_df_sorted[runner_df_sorted["seconds_to_start"] >= offset * 60]
+            offset_rows[offset] = eligible.iloc[0] if not eligible.empty else None
         row = {
             "market_id": market_id,
             "selection_id": selection_id,
@@ -137,12 +146,13 @@ def build_features_from_store(store, cutoff_minutes: int) -> pd.DataFrame:
                 for name in OFFSET_FEATURES:
                     row[f"{name}_t{offset}"] = None
                 continue
-            price = _select_snapshot_value(runner_df, offset, "best_back_price")
-            lay_price = _select_snapshot_value(runner_df, offset, "best_lay_price")
-            last_traded = _select_snapshot_value(runner_df, offset, "last_traded_price")
-            back_size = _select_snapshot_value(runner_df, offset, "best_back_size")
-            lay_size = _select_snapshot_value(runner_df, offset, "best_lay_size")
-            total_matched = _select_snapshot_value(runner_df, offset, "total_matched")
+            snapshot_row = offset_rows.get(offset)
+            price = snapshot_row.get("best_back_price") if snapshot_row is not None else None
+            lay_price = snapshot_row.get("best_lay_price") if snapshot_row is not None else None
+            last_traded = snapshot_row.get("last_traded_price") if snapshot_row is not None else None
+            back_size = snapshot_row.get("best_back_size") if snapshot_row is not None else None
+            lay_size = snapshot_row.get("best_lay_size") if snapshot_row is not None else None
+            total_matched = snapshot_row.get("total_matched") if snapshot_row is not None else None
             prob = 1.0 / price if price and price > 0 else None
             spread = (lay_price - price) if (price and lay_price) else None
             mid_price = (price + lay_price) / 2.0 if (price and lay_price) else None

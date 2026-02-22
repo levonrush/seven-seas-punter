@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Reduced feature-build runtime by pushing cutoff/time filtering into DuckDB and cutting repeated per-runner snapshot scans in Python.
 - Ignored generated manifest backup files (`data/*manifest.json.bak_*`) and bad-member artifact lists to prevent oversized accidental commits.
 - Improved stream-ingest throughput by batching DuckDB writes and using larger process-pool map chunks for per-file parsing.
 - Added ingest pre-checks for `.bz2` stream headers so non-bzip2 payloads are skipped before parsing and recorded to `artifacts/ingest_bad_stream_members.txt`.

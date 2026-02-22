@@ -381,6 +381,39 @@ class DuckDBStore:
         with self._connect() as con:
             return con.execute("SELECT * FROM snapshots").df()
 
+    def load_snapshots_for_cutoff(self, cutoff_minutes: int) -> pd.DataFrame:
+        """Return cutoff-filtered snapshots for feature building to reduce Python-side scan volume."""
+        cutoff_seconds = max(0, int(cutoff_minutes) * 60)
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT
+                    s.market_id,
+                    s.selection_id,
+                    s.snapshot_time,
+                    s.seconds_to_start,
+                    s.best_back_price,
+                    s.best_back_size,
+                    s.best_lay_price,
+                    s.best_lay_size,
+                    s.last_traded_price,
+                    s.total_matched,
+                    s.runner_status,
+                    s.venue,
+                    s.race_start_time,
+                    s.race_name,
+                    m.market_type
+                FROM snapshots AS s
+                LEFT JOIN markets AS m
+                  ON m.market_id = s.market_id
+                WHERE s.snapshot_time IS NOT NULL
+                  AND s.race_start_time IS NOT NULL
+                  AND s.snapshot_time < s.race_start_time
+                  AND s.seconds_to_start >= ?
+                """,
+                [cutoff_seconds],
+            ).df()
+
     def load_results(self) -> pd.DataFrame:
         """Return stored results to build targets."""
         with self._connect() as con:
