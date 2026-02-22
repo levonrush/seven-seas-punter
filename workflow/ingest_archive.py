@@ -16,6 +16,8 @@ from shared.utils.progress import log
 ALLOWED_EVENT_TYPE_IDS = {"7"}
 ALLOWED_COUNTRIES = {"AU"}
 ALLOWED_MARKET_TYPES = {"WIN"}
+BZIP2_MAGIC_PREFIX = b"BZh"
+DEFAULT_BAD_MEMBERS_OUTPUT = Path("artifacts/ingest_bad_stream_members.txt")
 
 
 def _load_ingest_manifest(path: Path) -> Dict:
@@ -52,6 +54,53 @@ def _seed_ingest_manifest(manifest: Dict, member_names: Iterable[str]) -> None:
         members[name] = {"ingested_at": seeded_at, "seeded": True}
     manifest["_members"] = set(members.keys())
     manifest["seeded_at"] = seeded_at
+
+
+def _is_bzip2_stream_prefix(prefix: bytes) -> bool:
+    """Validate stream magic bytes so ingest can skip HTML/error payloads before decompression."""
+    return prefix.startswith(BZIP2_MAGIC_PREFIX)
+
+
+def _partition_stream_members_by_header(
+    tar: tarfile.TarFile, members: list[tarfile.TarInfo]
+) -> tuple[list[tarfile.TarInfo], list[str]]:
+    """Split members into valid/invalid streams so ingest workers only parse bzip2 payloads."""
+    valid_members: list[tarfile.TarInfo] = []
+    invalid_member_names: list[str] = []
+    for member in members:
+        try:
+            with tar.extractfile(member) as fh:  # type: ignore[arg-type]
+                if fh is None:
+                    invalid_member_names.append(member.name)
+                    continue
+                prefix = fh.read(len(BZIP2_MAGIC_PREFIX))
+                if _is_bzip2_stream_prefix(prefix):
+                    valid_members.append(member)
+                else:
+                    invalid_member_names.append(member.name)
+        except OSError:
+            invalid_member_names.append(member.name)
+        except tarfile.TarError:
+            invalid_member_names.append(member.name)
+    return valid_members, invalid_member_names
+
+
+def _record_bad_stream_members(bad_member_names: Iterable[str], output_path: Path | None) -> int:
+    """Persist bad stream basenames so manifest repair can be automated after ingest failures."""
+    if output_path is None:
+        return 0
+    new_names = {Path(name).name for name in bad_member_names if str(name).strip()}
+    if not new_names:
+        return 0
+    existing = set()
+    if output_path.exists():
+        existing = {
+            line.strip() for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        }
+    merged = sorted(existing | new_names)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(merged) + "\n", encoding="utf-8")
+    return len(new_names - existing)
 
 
 def _load_member_as_df(tar: tarfile.TarFile, member: tarfile.TarInfo) -> pd.DataFrame:
@@ -315,6 +364,7 @@ def _ingest_bz_stream_archive(
     manifest: Dict | None = None,
     manifest_path: Path | None = None,
     save_every: int = 100,
+    bad_members_output: Path | None = DEFAULT_BAD_MEMBERS_OUTPUT,
 ) -> Dict[str, int]:
     """Parse Betfair historical stream (.bz2 inside tar) and write to DuckDB."""
     counts = {
@@ -332,6 +382,27 @@ def _ingest_bz_stream_archive(
         members = [m for m in tar.getmembers() if m.isfile() and m.name.endswith(".bz2")]
         if member_names is not None:
             members = [m for m in members if m.name in member_names]
+        members, invalid_members = _partition_stream_members_by_header(tar, members)
+        if invalid_members:
+            counts["bad_files"] += len(invalid_members)
+            log(
+                "Ingest: "
+                f"skipping {len(invalid_members)} invalid stream members (non-bzip2 payload)."
+            )
+            sample = invalid_members[:5]
+            for member_name in sample:
+                log(f"Ingest: invalid stream header {member_name}.")
+            if len(invalid_members) > len(sample):
+                log(
+                    "Ingest: "
+                    f"... plus {len(invalid_members) - len(sample)} additional invalid members."
+                )
+            appended = _record_bad_stream_members(invalid_members, bad_members_output)
+            if bad_members_output is not None:
+                log(
+                    "Ingest: "
+                    f"recorded {appended} new bad members -> {bad_members_output}."
+                )
         log(f"Found {len(members)} stream files in archive.")
         if workers is None:
             cpu_count = os.cpu_count() or 2
@@ -367,7 +438,8 @@ def _ingest_bz_stream_archive(
                             f"{result.get('name', 'unknown')} ({result.get('error')})."
                         )
                     if manifest is not None:
-                        _record_ingested(manifest, result.get("name", ""))
+                        if not result.get("error"):
+                            _record_ingested(manifest, result.get("name", ""))
                         if manifest_path and save_every and idx % save_every == 0:
                             _save_ingest_manifest(manifest_path, manifest)
                     if progress_every and idx % progress_every == 0:
@@ -385,6 +457,7 @@ def _ingest_bz_stream_archive(
             with tar.extractfile(member) as fh:  # type: ignore[arg-type]
                 if fh is None:
                     continue
+                member_failed = False
                 try:
                     with bz2.open(fh, "rt") as bz:
                         for line in bz:
@@ -430,9 +503,11 @@ def _ingest_bz_stream_archive(
                                         buffer = []
                 except OSError as exc:
                     counts["bad_files"] += 1
+                    member_failed = True
                     log(f"Ingest: failed to decompress {member.name} ({exc}).")
             if manifest is not None:
-                _record_ingested(manifest, member.name)
+                if not member_failed:
+                    _record_ingested(manifest, member.name)
                 if manifest_path and save_every and idx % save_every == 0:
                     _save_ingest_manifest(manifest_path, manifest)
     if buffer:
@@ -514,6 +589,11 @@ def main() -> None:
         "--ingest-manifest",
         help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
     )
+    parser.add_argument(
+        "--bad-members-output",
+        default=str(DEFAULT_BAD_MEMBERS_OUTPUT),
+        help="Path to append invalid stream-member basenames detected during ingest (set empty to disable).",
+    )
     args = parser.parse_args()
 
     log(
@@ -567,6 +647,7 @@ def main() -> None:
         incremental=incremental,
         manifest_path=manifest_path,
         force=args.force_ingest,
+        bad_members_output=Path(args.bad_members_output) if args.bad_members_output else None,
     )
     log(f"Ingested rows: {counts}")
     log("Ingest: complete.")
@@ -582,6 +663,7 @@ def ingest_archive_file(
     incremental: bool = False,
     manifest_path: Path | None = None,
     force: bool = False,
+    bad_members_output: Path | None = DEFAULT_BAD_MEMBERS_OUTPUT,
 ) -> Dict[str, int]:
     """Public helper to ingest a tar archive into DuckDB (stream or tabular)."""
     counts = {
@@ -591,6 +673,7 @@ def ingest_archive_file(
         "results": 0,
         "skipped_markets": 0,
         "bad_lines": 0,
+        "bad_files": 0,
     }
     manifest = None
     member_names: set[str] | None = None
@@ -637,6 +720,7 @@ def ingest_archive_file(
             manifest=manifest,
             manifest_path=manifest_path,
             save_every=progress_every or 100,
+            bad_members_output=bad_members_output,
         )
     log("Detected tabular archive (CSV/Parquet).")
     return _ingest_tabular_archive(

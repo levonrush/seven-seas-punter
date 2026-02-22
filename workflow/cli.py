@@ -17,6 +17,7 @@ from shared.model.training import load_model_and_calibrator, predict_probabiliti
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.cli_presets import go_historic_args, go_pipeline_args
+from shared.utils.manifest_repair import repair_manifests
 from shared.utils.market_types import (
     api_market_type_codes,
     market_type_matches,
@@ -69,6 +70,8 @@ def cmd_ingest(args: argparse.Namespace) -> None:
                 )
     elif incremental and manifest_path and not manifest_path.exists():
         log("Ingest: incremental manifest missing; full ingest will create it.")
+    bad_members_output_value = getattr(args, "bad_members_output", "artifacts/ingest_bad_stream_members.txt")
+    bad_members_output_path = pathlib.Path(bad_members_output_value) if bad_members_output_value else None
     counts = ingest_archive_file(
         archive_path,
         store,
@@ -79,6 +82,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         incremental=incremental,
         manifest_path=manifest_path,
         force=args.force_ingest,
+        bad_members_output=bad_members_output_path,
     )
     log(f"Ingested rows: {counts}")
 
@@ -109,6 +113,28 @@ def cmd_download_historic(args: argparse.Namespace) -> None:
     from workflow.download_historic import run_download_historic
 
     run_download_historic(args)
+
+
+def cmd_repair_manifests(args: argparse.Namespace) -> None:
+    """Repair ingest/download manifests by pruning known-bad basenames so retries can recover data holes."""
+    try:
+        summary = repair_manifests(
+            bad_list_path=pathlib.Path(args.bad_list),
+            historic_manifest_path=pathlib.Path(args.historic_manifest),
+            ingest_manifest_path=pathlib.Path(args.ingest_manifest),
+            backup=bool(args.backup),
+        )
+    except FileNotFoundError as exc:
+        log(str(exc))
+        return
+    log(
+        "Repair manifests: "
+        f"bad_basenames={summary['bad_basenames']} "
+        f"historic_removed={summary['historic_removed']} "
+        f"ingest_removed={summary['ingest_removed']}."
+    )
+    for backup_path in summary.get("backup_paths", []):
+        log(f"Repair manifests: backup -> {backup_path}")
 
 
 def _build_live_overrides(args: argparse.Namespace) -> dict:
@@ -1035,6 +1061,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ingest-manifest",
         help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
     )
+    p_ingest.add_argument(
+        "--bad-members-output",
+        default="artifacts/ingest_bad_stream_members.txt",
+        help="Path to append invalid stream-member basenames detected during ingest (set empty to disable).",
+    )
     p_ingest.set_defaults(func=cmd_ingest)
 
     p_dl = sub.add_parser("download", help="Download markets/snapshots for a date (or dry-run)")
@@ -1476,6 +1507,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ingest-manifest",
         help="Path to ingest manifest JSON (default data/ingest_manifest.json).",
     )
+    p_pipe.add_argument(
+        "--bad-members-output",
+        default="artifacts/ingest_bad_stream_members.txt",
+        help="Path to append invalid stream-member basenames detected during ingest (set empty to disable).",
+    )
     p_pipe.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_pipe.add_argument(
         "--market-types",
@@ -1623,6 +1659,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the default optimized flow (historic download -> incremental pipeline).",
     )
     p_go.set_defaults(func=cmd_go)
+
+    p_repair = sub.add_parser(
+        "repair-manifests",
+        help="Prune bad member basenames from historic/ingest manifests so retries can refill corrupted data.",
+    )
+    p_repair.add_argument(
+        "--bad-list",
+        default="artifacts/ingest_bad_stream_members.txt",
+        help="Newline-delimited bad basenames list (default artifacts/ingest_bad_stream_members.txt).",
+    )
+    p_repair.add_argument(
+        "--historic-manifest",
+        default="data/historic_manifest.json",
+        help="Path to historic download manifest.",
+    )
+    p_repair.add_argument(
+        "--ingest-manifest",
+        default="data/ingest_manifest.json",
+        help="Path to ingest manifest.",
+    )
+    p_repair.add_argument(
+        "--backup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Create timestamped backups before modifying manifests.",
+    )
+    p_repair.set_defaults(func=cmd_repair_manifests)
 
     p_qs = sub.add_parser("quickstart", help="Run a dry-run end-to-end using mock download data")
     p_qs.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])

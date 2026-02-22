@@ -34,6 +34,11 @@ punter ingest --incremental
 punter pipeline --cutoff-minutes 10 --ingest-new
 ```
 
+Repair manifests after detecting bad stream members:
+```bash
+punter repair-manifests --bad-list artifacts/ingest_bad_stream_members.txt
+```
+
 Train + backtest with an explicit split:
 ```bash
 punter train --cutoff-minutes 10 --split-date 2017-04-01 --run-id myrun
@@ -122,6 +127,8 @@ When you need control beyond `punter go`, tune directly with command-specific fl
 - If snapshots already exist and the ingest manifest is present, ingest auto-switches to incremental mode.
 - If snapshots exist but the ingest manifest is missing, ingest seeds the manifest from the archive and skips ingest to avoid duplicates.
 - First incremental run creates the manifest; keep it alongside your DuckDB for repeats.
+- Stream ingest pre-validates `.bz2` headers and records invalid members to `artifacts/ingest_bad_stream_members.txt`.
+- Use `punter repair-manifests` to prune those bad members from download/ingest manifests for recovery reruns.
 - Use `--force-ingest` to reprocess the full archive (may duplicate data).
 
 ## Logging

@@ -3,6 +3,10 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added ingest pre-checks for `.bz2` stream headers so non-bzip2 payloads are skipped before parsing and recorded to `artifacts/ingest_bad_stream_members.txt`.
+- Added `punter repair-manifests` to prune known-bad member basenames from historic and ingest manifests (with timestamped backups by default).
+- Hardened historic downloads against HTML/error payloads by validating bzip2 signatures before saving, with session-refresh retry on HTML responses.
+- Stream ingest now avoids marking decompression failures as ingested, so corrupted members remain retryable in incremental mode.
 - Added `config/README.md` with `live.yaml` usage and safe editing guidance for `punter live` configuration.
 - Removed inlined Kelly/staking derivation from top-level README and made root docs more navigation-first with explicit links to focused docs.
 - Added a docs hub (`docs/README.md`) and split CLI runbook/theory into focused pages (`docs/cli_playbook.md`, `docs/pub_domain_adaptation.md`) to reduce README duplication.

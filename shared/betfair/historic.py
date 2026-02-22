@@ -103,6 +103,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _is_bzip2_stream_prefix(data: bytes) -> bool:
+    """Detect valid bzip2 payloads early so HTML/API error pages are never treated as market files."""
+    return data.startswith(b"BZh")
+
+
+def _classify_non_bzip2_payload(data: bytes) -> str:
+    """Classify unexpected download payloads to separate auth/package issues from generic corruption."""
+    text = data.decode("utf-8", errors="ignore").lower()
+    if "package_not_purchased" in text:
+        return "package_not_purchased"
+    if "<html" in text or "<!doctype html" in text:
+        return "html_response"
+    return "unknown_payload"
+
+
+def _payload_snippet(data: bytes, limit: int = 120) -> str:
+    """Return a short printable payload snippet so download logs explain non-bzip2 failures."""
+    text = data.decode("utf-8", errors="ignore").replace("\n", " ").replace("\r", " ").strip()
+    if not text:
+        return "binary payload"
+    return text[:limit]
+
+
 class HistoricDataClient:
     """Client for Betfair historic data API using SSO session tokens."""
 
@@ -288,24 +311,36 @@ class HistoricDataClient:
         """Download a single historic data file to disk, retrying on transient errors."""
         encoded = urllib.parse.quote(file_path, safe="")
         url = f"{HISTORIC_BASE_URL}/DownloadFile?filePath={encoded}"
-        for attempt in range(1, retries + 1):
+        attempts = max(1, int(retries))
+        for attempt in range(1, attempts + 1):
             try:
                 resp = self._request("GET", url, headers=self._headers(), stream=True, timeout=120)
                 resp.raise_for_status()
+                first_chunk: bytes | None = None
                 with open(output_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
                         if chunk:
+                            if first_chunk is None:
+                                first_chunk = chunk
+                                if not _is_bzip2_stream_prefix(first_chunk):
+                                    payload_kind = _classify_non_bzip2_payload(first_chunk)
+                                    raise RuntimeError(
+                                        "unexpected non-bzip2 payload "
+                                        f"({payload_kind}): {_payload_snippet(first_chunk)}"
+                                    )
                             fh.write(chunk)
+                if first_chunk is None:
+                    raise RuntimeError("empty response body")
                 return
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response else None
                 retryable = status in {429} or (status is not None and status >= 500)
-                if retryable and attempt < retries:
+                if retryable and attempt < attempts:
                     wait_for = retry_wait * attempt
                     log(
                         "Historic download: "
-                        f"file failed (HTTP {status}); retrying in {wait_for}s "
-                        f"({attempt}/{retries}) -> {file_path}"
+                        f"file failed (HTTP {status}); retrying in {wait_for}s ({attempt}/{attempts}) "
+                        f"-> {file_path}"
                     )
                     if os.path.exists(output_path):
                         os.remove(output_path)
@@ -315,15 +350,36 @@ class HistoricDataClient:
                     os.remove(output_path)
                 raise
             except requests.RequestException as exc:
-                if attempt < retries:
+                if attempt < attempts:
                     wait_for = retry_wait * attempt
                     log(
                         "Historic download: "
-                        f"file request error; retrying in {wait_for}s "
-                        f"({attempt}/{retries}) -> {file_path} ({exc})"
+                        f"file request error; retrying in {wait_for}s ({attempt}/{attempts}) "
+                        f"-> {file_path} ({exc})"
                     )
                     if os.path.exists(output_path):
                         os.remove(output_path)
+                    time.sleep(wait_for)
+                    continue
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                raise
+            except RuntimeError as exc:
+                error_text = str(exc).lower()
+                can_retry = (
+                    "unexpected non-bzip2 payload (html_response)" in error_text
+                    and attempt < attempts
+                )
+                if can_retry:
+                    wait_for = retry_wait * attempt
+                    log(
+                        "Historic download: "
+                        f"received HTML payload; refreshing session and retrying in {wait_for}s "
+                        f"({attempt}/{attempts}) -> {file_path}"
+                    )
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    self.ssoid = self._login()
                     time.sleep(wait_for)
                     continue
                 if os.path.exists(output_path):
