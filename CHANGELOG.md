@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Improved stream-ingest throughput by batching DuckDB writes and using larger process-pool map chunks for per-file parsing.
 - Added ingest pre-checks for `.bz2` stream headers so non-bzip2 payloads are skipped before parsing and recorded to `artifacts/ingest_bad_stream_members.txt`.
 - Added `punter repair-manifests` to prune known-bad member basenames from historic and ingest manifests (with timestamped backups by default).
 - Hardened historic downloads against HTML/error payloads by validating bzip2 signatures before saving, with session-refresh retry on HTML responses.

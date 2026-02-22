@@ -103,6 +103,42 @@ def _record_bad_stream_members(bad_member_names: Iterable[str], output_path: Pat
     return len(new_names - existing)
 
 
+def _compute_executor_chunksize(task_count: int, workers: int) -> int:
+    """Choose a coarse process-pool chunksize so tiny per-file parse tasks avoid scheduler overhead."""
+    if task_count <= 0:
+        return 1
+    target_batches = max(1, workers * 8)
+    return max(1, min(512, task_count // target_batches))
+
+
+def _flush_stream_buffers(
+    store: DuckDBStore,
+    market_buffer: list[dict],
+    runner_buffer: list[dict],
+    result_buffer: list[dict],
+    snapshot_buffer: list[dict],
+    *,
+    market_flush_every: int,
+    runner_flush_every: int,
+    result_flush_every: int,
+    snapshot_flush_every: int,
+    force: bool = False,
+) -> None:
+    """Write buffered stream rows in larger batches so ingest throughput is not dominated by tiny DB writes."""
+    if (force or len(market_buffer) >= market_flush_every) and market_buffer:
+        store.upsert_markets(market_buffer)
+        market_buffer.clear()
+    if (force or len(runner_buffer) >= runner_flush_every) and runner_buffer:
+        store.upsert_runners(runner_buffer)
+        runner_buffer.clear()
+    if (force or len(result_buffer) >= result_flush_every) and result_buffer:
+        store.upsert_results(result_buffer)
+        result_buffer.clear()
+    if (force or len(snapshot_buffer) >= snapshot_flush_every) and snapshot_buffer:
+        store.append_snapshots(snapshot_buffer)
+        snapshot_buffer.clear()
+
+
 def _load_member_as_df(tar: tarfile.TarFile, member: tarfile.TarInfo) -> pd.DataFrame:
     """Read a tar member into a DataFrame, supporting CSV and Parquet."""
     with tar.extractfile(member) as fh:  # type: ignore[arg-type]
@@ -189,18 +225,6 @@ def _market_definition_to_rows(
         "eligible": True,
     }
     return market_row, runners, results, meta
-
-
-def _handle_market_definition(market_id: str, md: Dict, store: DuckDBStore, filter_au_win: bool) -> Dict:
-    """Convert marketDefinition into metadata and upsert market/runner records."""
-    market_row, runners, results, meta = _market_definition_to_rows(market_id, md, filter_au_win)
-    if market_row:
-        store.upsert_markets([market_row])
-        if runners:
-            store.upsert_runners(runners)
-        if results:
-            store.upsert_results(results)
-    return meta
 
 
 def _append_snapshots_from_rc(
@@ -377,7 +401,14 @@ def _ingest_bz_stream_archive(
         "bad_files": 0,
     }
     market_meta: Dict[str, Dict] = {}
-    buffer: List[Dict] = []
+    pending_markets: list[dict] = []
+    pending_runners: list[dict] = []
+    pending_results: list[dict] = []
+    pending_snapshots: list[dict] = []
+    market_flush_every = max(2000, flush_every)
+    runner_flush_every = max(5000, flush_every * 2)
+    result_flush_every = max(2000, flush_every)
+    snapshot_flush_every = max(5000, flush_every)
     with tarfile.open(archive_path, "r") as tar:
         members = [m for m in tar.getmembers() if m.isfile() and m.name.endswith(".bz2")]
         if member_names is not None:
@@ -409,27 +440,44 @@ def _ingest_bz_stream_archive(
             workers = max(1, min(cpu_count - 1, len(members)))
         if workers > 1:
             log(f"Ingest: using {workers} workers (auto).")
-            tasks = [(str(archive_path), m.offset_data, m.size, m.name, filter_au_win) for m in members]
+            task_count = len(members)
+            chunksize = _compute_executor_chunksize(task_count, workers)
+            tasks = (
+                (str(archive_path), m.offset_data, m.size, m.name, filter_au_win)
+                for m in members
+            )
             with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-                for idx, result in enumerate(executor.map(_parse_member_from_offset, tasks), start=1):
+                for idx, result in enumerate(
+                    executor.map(_parse_member_from_offset, tasks, chunksize=chunksize),
+                    start=1,
+                ):
                     market_rows = result["market_rows"]
                     runner_rows = result["runner_rows"]
                     result_rows = result["result_rows"]
                     snapshot_rows = result["snapshot_rows"]
                     if market_rows:
-                        store.upsert_markets(market_rows)
+                        pending_markets.extend(market_rows)
                         counts["markets"] += len(market_rows)
                     if runner_rows:
-                        store.upsert_runners(runner_rows)
+                        pending_runners.extend(runner_rows)
                         counts["runners"] += len(runner_rows)
                     if result_rows:
-                        store.upsert_results(result_rows)
+                        pending_results.extend(result_rows)
                         counts["results"] += len(result_rows)
                     if snapshot_rows:
-                        for i in range(0, len(snapshot_rows), flush_every):
-                            chunk = snapshot_rows[i : i + flush_every]
-                            store.append_snapshots(chunk)
-                            counts["snapshots"] += len(chunk)
+                        pending_snapshots.extend(snapshot_rows)
+                        counts["snapshots"] += len(snapshot_rows)
+                    _flush_stream_buffers(
+                        store,
+                        pending_markets,
+                        pending_runners,
+                        pending_results,
+                        pending_snapshots,
+                        market_flush_every=market_flush_every,
+                        runner_flush_every=runner_flush_every,
+                        result_flush_every=result_flush_every,
+                        snapshot_flush_every=snapshot_flush_every,
+                    )
                     counts["bad_lines"] += result.get("bad_lines", 0)
                     counts["bad_files"] += result.get("bad_files", 0)
                     if result.get("error"):
@@ -444,8 +492,20 @@ def _ingest_bz_stream_archive(
                             _save_ingest_manifest(manifest_path, manifest)
                     if progress_every and idx % progress_every == 0:
                         log(
-                            f"Processed {idx}/{len(tasks)} files; snapshots={counts['snapshots']} markets={counts['markets']}"
+                            f"Processed {idx}/{task_count} files; snapshots={counts['snapshots']} markets={counts['markets']}"
                         )
+            _flush_stream_buffers(
+                store,
+                pending_markets,
+                pending_runners,
+                pending_results,
+                pending_snapshots,
+                market_flush_every=market_flush_every,
+                runner_flush_every=runner_flush_every,
+                result_flush_every=result_flush_every,
+                snapshot_flush_every=snapshot_flush_every,
+                force=True,
+            )
             if manifest is not None and manifest_path:
                 _save_ingest_manifest(manifest_path, manifest)
             return counts
@@ -474,33 +534,39 @@ def _ingest_bz_stream_archive(
                                 if not market_id:
                                     continue
                                 if "marketDefinition" in mc:
-                                    meta = _handle_market_definition(
-                                        market_id, mc["marketDefinition"], store, filter_au_win
+                                    market_row, runner_rows, result_rows, meta = _market_definition_to_rows(
+                                        market_id, mc["marketDefinition"], filter_au_win
                                     )
                                     market_meta[market_id] = meta
-                                    if meta.get("eligible"):
+                                    if market_row:
+                                        pending_markets.append(market_row)
+                                        pending_runners.extend(runner_rows)
+                                        pending_results.extend(result_rows)
                                         counts["markets"] += 1
-                                        counts["runners"] += len(
-                                            mc["marketDefinition"].get("runners", [])
-                                        )
-                                        if mc["marketDefinition"].get("status") == "CLOSED":
-                                            counts["results"] += len(
-                                                mc["marketDefinition"].get("runners", [])
-                                            )
+                                        counts["runners"] += len(runner_rows)
+                                        counts["results"] += len(result_rows)
                                     else:
                                         counts["skipped_markets"] += 1
                                 if "rc" in mc:
                                     meta = market_meta.get(market_id, {})
                                     if filter_au_win and not meta.get("eligible"):
                                         continue
-                                    _append_snapshots_from_rc(market_id, mc["rc"], pt_ms, meta, buffer)
-                                    if len(buffer) >= flush_every:
-                                        store.append_snapshots(buffer)
-                                        counts["snapshots"] += len(buffer)
-                                        log(
-                                            f"Flushed {len(buffer)} snapshots (total {counts['snapshots']})."
-                                        )
-                                        buffer = []
+                                    pre_size = len(pending_snapshots)
+                                    _append_snapshots_from_rc(
+                                        market_id, mc["rc"], pt_ms, meta, pending_snapshots
+                                    )
+                                    counts["snapshots"] += len(pending_snapshots) - pre_size
+                                    _flush_stream_buffers(
+                                        store,
+                                        pending_markets,
+                                        pending_runners,
+                                        pending_results,
+                                        pending_snapshots,
+                                        market_flush_every=market_flush_every,
+                                        runner_flush_every=runner_flush_every,
+                                        result_flush_every=result_flush_every,
+                                        snapshot_flush_every=snapshot_flush_every,
+                                    )
                 except OSError as exc:
                     counts["bad_files"] += 1
                     member_failed = True
@@ -510,10 +576,18 @@ def _ingest_bz_stream_archive(
                     _record_ingested(manifest, member.name)
                 if manifest_path and save_every and idx % save_every == 0:
                     _save_ingest_manifest(manifest_path, manifest)
-    if buffer:
-        store.append_snapshots(buffer)
-        counts["snapshots"] += len(buffer)
-        log(f"Final flush: {len(buffer)} snapshots (total {counts['snapshots']}).")
+    _flush_stream_buffers(
+        store,
+        pending_markets,
+        pending_runners,
+        pending_results,
+        pending_snapshots,
+        market_flush_every=market_flush_every,
+        runner_flush_every=runner_flush_every,
+        result_flush_every=result_flush_every,
+        snapshot_flush_every=snapshot_flush_every,
+        force=True,
+    )
     if manifest is not None and manifest_path:
         _save_ingest_manifest(manifest_path, manifest)
     return counts
