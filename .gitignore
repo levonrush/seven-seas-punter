@@ -17,6 +17,8 @@ data/*.duckdb.wal
 data/*.parquet
 data/historic_manifest.json
 data/ingest_manifest.json
+data/historic_manifest.json.bak_*
+data/ingest_manifest.json.bak_*
 data/historic_lists/
 data/**/*.bz2
 data/**/*.tar
@@ -26,6 +28,8 @@ data/**/*.csv
 artifacts/*.joblib
 artifacts/*.csv
 artifacts/*.json
+artifacts/ingest_bad_stream_members.txt
+artifacts/bad_bz2_basenames.txt
 
 .DS_Store
 
