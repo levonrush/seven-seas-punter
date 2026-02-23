@@ -6,6 +6,7 @@ All production logic lives here. Workflows and notebooks should import from this
 - `shared/betfair/`: Betfair API wrappers and historic downloader helpers.
 - `shared/storage/`: DuckDB schema and store helpers.
 - `shared/features/`: leakage-safe feature builder.
+- `shared/form/`: external licensed form-run ingestion normalizers.
 - `shared/model/`: LightGBM training, calibration, and prediction helpers.
 - `shared/backtest/`: value strategy engine and strategy tuning.
 - `shared/utils/`: logging and bet-explain utilities.

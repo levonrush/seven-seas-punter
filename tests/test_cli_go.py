@@ -20,7 +20,13 @@ from shared.model.training import (
     DEFAULT_CALIBRATION_RANDOM_STATE,
     DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
 )
-from workflow.cli import build_parser, cmd_go, cmd_repair_manifests
+from workflow.cli import (
+    DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES,
+    DEFAULT_EXTERNAL_FORM_SOURCE,
+    build_parser,
+    cmd_go,
+    cmd_repair_manifests,
+)
 
 
 def test_recommended_historic_workers_is_bounded():
@@ -188,6 +194,55 @@ def test_cmd_go_disables_stale_refresh_when_threshold_negative(monkeypatch):
     assert parsed_tokens[0][0] == "pipeline"
 
 
+def test_cmd_go_forwards_external_form_flags_to_pipeline(monkeypatch):
+    parsed_tokens = []
+    executed = []
+
+    class _FakeParser:
+        """Capture parsed token lists and run synthetic command handlers."""
+
+        def parse_args(self, tokens):  # noqa: ANN001 - mirror argparse signature
+            parsed_tokens.append(list(tokens))
+            command = tokens[0]
+
+            def _runner(_args):  # noqa: ANN001 - mirror argparse callback signature
+                executed.append(command)
+
+            return argparse.Namespace(func=_runner)
+
+    monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(
+            table_row_count=lambda _table: 10,
+            max_snapshot_time=lambda: "2099-01-01T00:00:00+00:00",
+        ),
+    )
+
+    cmd_go(
+        argparse.Namespace(
+            refresh_historic=False,
+            external_form_ingest=False,
+            external_form_input="data/provider_runs.jsonl",
+            external_form_source="provider_x",
+            external_form_default_cutoff_minutes=30,
+            external_form_default_snapshot_time="2026-02-23T00:00:00Z",
+        )
+    )
+
+    assert executed == ["pipeline"]
+    assert parsed_tokens[0][0] == "pipeline"
+    assert "--no-external-form-ingest" in parsed_tokens[0]
+    assert "--external-form-input" in parsed_tokens[0]
+    assert "data/provider_runs.jsonl" in parsed_tokens[0]
+    assert "--external-form-source" in parsed_tokens[0]
+    assert "provider_x" in parsed_tokens[0]
+    assert "--external-form-default-cutoff-minutes" in parsed_tokens[0]
+    assert "30" in parsed_tokens[0]
+    assert "--external-form-default-snapshot-time" in parsed_tokens[0]
+    assert "2026-02-23T00:00:00Z" in parsed_tokens[0]
+
+
 def test_parser_accepts_repair_manifests_command():
     parser = build_parser()
     args = parser.parse_args(["repair-manifests", "--no-backup"])
@@ -227,6 +282,11 @@ def test_parser_pipeline_has_decision_market_type_default():
     args = parser.parse_args(["pipeline"])
     assert args.market_types == "ALL"
     assert args.decision_market_types == "WIN"
+    assert args.external_form_ingest is True
+    assert args.external_form_input is None
+    assert args.external_form_source == DEFAULT_EXTERNAL_FORM_SOURCE
+    assert args.external_form_default_cutoff_minutes == DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES
+    assert args.external_form_default_snapshot_time is None
 
 
 def test_parser_go_refresh_historic_default_is_false():
@@ -234,6 +294,11 @@ def test_parser_go_refresh_historic_default_is_false():
     args = parser.parse_args(["go"])
     assert args.refresh_historic is False
     assert args.refresh_historic_if_stale_days == go_historic_stale_days_default()
+    assert args.external_form_ingest is True
+    assert args.external_form_input is None
+    assert args.external_form_source == DEFAULT_EXTERNAL_FORM_SOURCE
+    assert args.external_form_default_cutoff_minutes == DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES
+    assert args.external_form_default_snapshot_time is None
 
 
 def test_parser_train_calibration_defaults():
@@ -310,3 +375,11 @@ def test_parser_pipeline_filters_default_to_opt_in():
     assert args.preds_use_kappa_threshold is False
     assert args.tune_strategy is False
     assert args.strategy_min_prob is None
+
+
+def test_parser_ingest_form_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["ingest-form", "--input", "data/external_form.json"])
+    assert args.source == "external_form_provider"
+    assert args.default_cutoff_minutes == 10
+    assert args.default_snapshot_time is None

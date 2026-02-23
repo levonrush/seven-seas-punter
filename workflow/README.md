@@ -3,6 +3,7 @@
 CLI entrypoints live here. These scripts are thin wrappers around the shared library in `shared/`.
 
 Canonical CLI runbook: `docs/cli_playbook.md`.
+Form-modeling design and leakage controls: `docs/form_intelligence_layer.md`.
 
 ## Common flows
 
@@ -13,6 +14,7 @@ punter go
 This runs:
 - `download-historic --auto --market-types ALL --workers <auto> --clean-temp` (only when needed)
 - `pipeline --ingest-new --cutoff-minutes 10`
+- external form auto-ingest (enabled by default when a default file is found and the table is empty)
 
 `go` checks DuckDB freshness first:
 - if snapshots are fresh, it skips `download-historic`;
@@ -44,6 +46,20 @@ Incremental ingest (only new archive members):
 ```bash
 punter ingest --incremental
 punter pipeline --cutoff-minutes 10 --ingest-new
+```
+
+Ingest licensed external form-run exports (for P1 features):
+```bash
+punter ingest-form --input data/external_form_runs.json --source punting_form
+```
+Default-on auto-ingest also runs in `features/train/backtest/score/pipeline/go` when:
+- `external_runner_form_runs` is empty, and
+- one of these files exists: `data/external_form_runs.parquet|csv|json|jsonl` or `data/external_form.json`.
+
+Disable auto-ingest per command when needed:
+```bash
+punter go --no-external-form-ingest
+punter pipeline --no-external-form-ingest
 ```
 
 Repair manifests after detecting bad stream members:

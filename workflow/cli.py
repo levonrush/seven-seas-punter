@@ -10,6 +10,7 @@ from shared.backtest.allocation import allocate_stakes_from_budget, summarize_bu
 from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
+from shared.form.ingest import load_external_form_rows
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.market_type import bucket_market_type
 from shared.model.predictions import build_prediction_preview
@@ -38,6 +39,16 @@ from shared.utils.market_types import (
 )
 from shared.utils.progress import log
 from workflow.ingest_archive import ingest_archive_file
+
+DEFAULT_EXTERNAL_FORM_SOURCE = "external_form_provider"
+DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES = 10
+DEFAULT_EXTERNAL_FORM_INPUT_CANDIDATES = (
+    pathlib.Path("data/external_form_runs.parquet"),
+    pathlib.Path("data/external_form_runs.csv"),
+    pathlib.Path("data/external_form_runs.json"),
+    pathlib.Path("data/external_form_runs.jsonl"),
+    pathlib.Path("data/external_form.json"),
+)
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -101,7 +112,10 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
 def cmd_download(args: argparse.Namespace) -> None:
     """Download Betfair markets/snapshots/results for a date (mocked in dry-run)."""
-    from workflow.download_data import capture_snapshots  # local import to reuse helper
+    from workflow.download_data import (  # local import to reuse helpers
+        capture_snapshots,
+        extract_runner_metadata_snapshots,
+    )
 
     target_date = dt.date.fromisoformat(args.date)
     client = BetfairClient()
@@ -113,11 +127,33 @@ def cmd_download(args: argparse.Namespace) -> None:
     market_ids = [m["market_id"] for m in markets]
     runner_rows = [r for m in markets for r in m["runners"]]
     store.upsert_runners(runner_rows)
+    metadata_rows = extract_runner_metadata_snapshots(markets, source="list_market_catalogue")
+    store.append_runner_metadata_snapshots(metadata_rows)
     snapshots = capture_snapshots(client, market_ids, offsets=[60, 30, 10, 5, 2, 1])
     store.append_snapshots(snapshots)
     results = client.fetch_market_results(market_ids)
     store.upsert_results(results)
-    log(f"Downloaded {len(markets)} markets, {len(runner_rows)} runners, {len(snapshots)} snapshots.")
+    log(
+        "Downloaded "
+        f"{len(markets)} markets, {len(runner_rows)} runners, "
+        f"{len(metadata_rows)} metadata snapshots, {len(snapshots)} price snapshots."
+    )
+
+
+def cmd_ingest_form(args: argparse.Namespace) -> None:
+    """Ingest licensed external form-run snapshots so P1 features are reproducible at inference cutoff."""
+    store = DuckDBStore()
+    rows = load_external_form_rows(
+        args.input,
+        source=args.source,
+        default_cutoff_minutes=args.default_cutoff_minutes,
+        default_snapshot_time=args.default_snapshot_time,
+    )
+    if not rows:
+        log("Ingest form: no valid rows found in input payload.")
+        return
+    store.append_external_runner_form_runs(rows)
+    log(f"Ingest form: wrote {len(rows)} rows from {args.input}.")
 
 
 def cmd_download_historic(args: argparse.Namespace) -> None:
@@ -482,10 +518,62 @@ def _parse_tab_quantile(raw_value: float | None) -> float:
     return quantile
 
 
+def _resolve_external_form_input_path(explicit_input: str | None) -> pathlib.Path | None:
+    """Resolve the external-form input path so default-on form features work without manual file flags."""
+    if explicit_input:
+        candidate = pathlib.Path(explicit_input).expanduser()
+        return candidate if candidate.exists() else None
+    for candidate in DEFAULT_EXTERNAL_FORM_INPUT_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _maybe_auto_ingest_external_form(args: argparse.Namespace, store: DuckDBStore) -> None:
+    """Auto-ingest external form data once per command run so form features are enabled by default."""
+    if getattr(args, "_external_form_auto_ingest_attempted", False):
+        return
+    setattr(args, "_external_form_auto_ingest_attempted", True)
+
+    if not getattr(args, "external_form_ingest", True):
+        log("External form ingest: disabled by CLI flag (--no-external-form-ingest).")
+        return
+
+    explicit_input = getattr(args, "external_form_input", None)
+    input_path = _resolve_external_form_input_path(explicit_input)
+    if input_path is None:
+        if explicit_input:
+            log(f"External form ingest: input not found at {explicit_input}; skipping.")
+        return
+
+    existing_rows = store.table_row_count("external_runner_form_runs")
+    if existing_rows > 0:
+        return
+
+    default_cutoff = getattr(
+        args,
+        "external_form_default_cutoff_minutes",
+        DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES,
+    )
+    source = getattr(args, "external_form_source", DEFAULT_EXTERNAL_FORM_SOURCE)
+    rows = load_external_form_rows(
+        str(input_path),
+        source=str(source),
+        default_cutoff_minutes=int(default_cutoff),
+        default_snapshot_time=getattr(args, "external_form_default_snapshot_time", None),
+    )
+    if not rows:
+        log(f"External form ingest: no valid rows found in {input_path}; skipping.")
+        return
+    store.append_external_runner_form_runs(rows)
+    log(f"External form ingest: wrote {len(rows)} rows from {input_path}.")
+
+
 def cmd_features(args: argparse.Namespace) -> None:
     """Build features at a cutoff minute and save Parquet."""
     print(f"Building features (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    _maybe_auto_ingest_external_form(args, store)
     features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
     output_path = pathlib.Path("data") / f"features_cutoff_{args.cutoff_minutes}.parquet"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -502,6 +590,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     """Train LightGBM (Optuna tuned) + calibrator and persist artefacts."""
     print(f"Training model (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    _maybe_auto_ingest_external_form(args, store)
     market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
     _ensure_run_id(args)
     _apply_split_from_days(args, store)
@@ -649,6 +738,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     """Backtest value strategy using trained model (or implied probs fallback)."""
     print(f"Backtesting (cutoff T-{args.cutoff_minutes})...")
     store = DuckDBStore()
+    _maybe_auto_ingest_external_form(args, store)
     market_tokens = normalize_market_type_tokens(getattr(args, "market_types", "ALL"))
     _ensure_backtest_run_id(args, store)
     if not getattr(args, "run_id", None):
@@ -756,6 +846,7 @@ def cmd_score(args: argparse.Namespace) -> None:
     if args.dry_run:
         client._dry_run = True  # type: ignore[attr-defined]
     store = DuckDBStore()
+    _maybe_auto_ingest_external_form(args, store)
 
     markets = client.list_markets_for_date(today, market_types=api_market_type_codes(market_tokens))
     if selected is not None:
@@ -992,6 +1083,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         tables = [
             "markets",
             "runners",
+            "runner_metadata_snapshots",
+            "external_runner_form_runs",
             "snapshots",
             "results",
             "bets",
@@ -1148,6 +1241,30 @@ def cmd_report(args: argparse.Namespace) -> None:
                 f"bets={bets}, roi={roi:.4f}, expected_roi={expected_roi:.4f}, "
                 f"hit_rate={hit_rate:.3f}, sample={sample_label}."
             )
+    if hasattr(store, "load_runner_metadata_completeness"):
+        completeness = store.load_runner_metadata_completeness()
+        if not completeness.empty:
+            latest = completeness.iloc[0]
+            log(
+                "Runner metadata completeness: "
+                f"date={latest['snapshot_date']} rows={int(latest['row_count'])} "
+                f"jockey={latest['jockey_name_coverage']:.2%} "
+                f"trainer={latest['trainer_name_coverage']:.2%} "
+                f"official_rating={latest['official_rating_coverage']:.2%} "
+                f"stall_draw={latest['stall_draw_coverage']:.2%}."
+            )
+    if hasattr(store, "load_external_runner_form_completeness"):
+        external_form = store.load_external_runner_form_completeness()
+        if not external_form.empty:
+            latest = external_form.iloc[0]
+            log(
+                "External form completeness: "
+                f"date={latest['snapshot_date']} rows={int(latest['row_count'])} "
+                f"run_date={latest['run_date_coverage']:.2%} "
+                f"finish_pos={latest['run_finish_pos_coverage']:.2%} "
+                f"sectional={latest['run_sectional_coverage']:.2%} "
+                f"speed_rating={latest['run_speed_rating_coverage']:.2%}."
+            )
 
 def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
@@ -1288,6 +1405,29 @@ def cmd_go(args: argparse.Namespace) -> None:
         log("Go: skipping `punter download-historic`.")
 
     pipeline_tokens = ["pipeline", *go_pipeline_args()]
+    if not getattr(args, "external_form_ingest", True):
+        pipeline_tokens.append("--no-external-form-ingest")
+
+    external_form_input = getattr(args, "external_form_input", None)
+    if external_form_input:
+        pipeline_tokens.extend(["--external-form-input", str(external_form_input)])
+
+    external_form_source = getattr(args, "external_form_source", DEFAULT_EXTERNAL_FORM_SOURCE)
+    if external_form_source != DEFAULT_EXTERNAL_FORM_SOURCE:
+        pipeline_tokens.extend(["--external-form-source", str(external_form_source)])
+
+    external_form_cutoff = getattr(
+        args,
+        "external_form_default_cutoff_minutes",
+        DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES,
+    )
+    if int(external_form_cutoff) != DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES:
+        pipeline_tokens.extend(["--external-form-default-cutoff-minutes", str(int(external_form_cutoff))])
+
+    external_form_snapshot_time = getattr(args, "external_form_default_snapshot_time", None)
+    if external_form_snapshot_time:
+        pipeline_tokens.extend(["--external-form-default-snapshot-time", str(external_form_snapshot_time)])
+
     log(f"Go: running `punter {' '.join(pipeline_tokens)}`")
     pipeline_args = parser.parse_args(pipeline_tokens)
     pipeline_args.func(pipeline_args)
@@ -1334,6 +1474,41 @@ def _add_execution_domain_arguments(
     )
 
 
+def _add_external_form_auto_ingest_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach default-on external form ingest flags so new form layers are active unless explicitly disabled."""
+    parser.add_argument(
+        "--external-form-ingest",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Automatically ingest external form data when a default file is found and the table is empty "
+            "(enabled by default)."
+        ),
+    )
+    parser.add_argument(
+        "--external-form-input",
+        help=(
+            "Optional explicit path for auto-ingest input. "
+            "If omitted, common defaults in data/ are auto-detected."
+        ),
+    )
+    parser.add_argument(
+        "--external-form-source",
+        default=DEFAULT_EXTERNAL_FORM_SOURCE,
+        help="Source label used when auto-ingesting external form rows.",
+    )
+    parser.add_argument(
+        "--external-form-default-cutoff-minutes",
+        type=int,
+        default=DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES,
+        help="Fallback cutoff used by auto external-form ingestion when rows omit seconds_to_start.",
+    )
+    parser.add_argument(
+        "--external-form-default-snapshot-time",
+        help="Fallback snapshot timestamp (ISO) used by auto external-form ingestion when missing in rows.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI parser with subcommands."""
     parser = argparse.ArgumentParser(description="Seven Seas Punter pipeline CLI")
@@ -1361,6 +1536,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to append invalid stream-member basenames detected during ingest (set empty to disable).",
     )
     p_ingest.set_defaults(func=cmd_ingest)
+
+    p_form = sub.add_parser(
+        "ingest-form",
+        help="Ingest external licensed form-run exports (CSV/JSON/JSONL/Parquet).",
+    )
+    p_form.add_argument("--input", required=True, help="Path to external form export file.")
+    p_form.add_argument(
+        "--source",
+        default=DEFAULT_EXTERNAL_FORM_SOURCE,
+        help="Source label stored with rows (e.g., punting_form).",
+    )
+    p_form.add_argument(
+        "--default-cutoff-minutes",
+        type=int,
+        default=DEFAULT_EXTERNAL_FORM_DEFAULT_CUTOFF_MINUTES,
+        help="Fallback cutoff used when snapshot times are missing in the export.",
+    )
+    p_form.add_argument(
+        "--default-snapshot-time",
+        help="Optional fallback snapshot timestamp (ISO) when input rows omit snapshot_time.",
+    )
+    p_form.set_defaults(func=cmd_ingest_form)
 
     p_dl = sub.add_parser("download", help="Download markets/snapshots for a date (or dry-run)")
     p_dl.add_argument("--date", required=True, help="ISO date, e.g., 2024-01-01")
@@ -1456,6 +1653,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_feat = sub.add_parser("features", help="Build features at cutoff")
     p_feat.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
+    _add_external_form_auto_ingest_arguments(p_feat)
     p_feat.set_defaults(func=cmd_features)
 
     p_train = sub.add_parser("train", help="Train model at cutoff")
@@ -1621,6 +1819,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CALIBRATION_RANDOM_STATE,
         help="Random seed for within-window calibration sampling.",
     )
+    _add_external_form_auto_ingest_arguments(p_train)
     p_train.set_defaults(func=cmd_train)
 
     p_bt = sub.add_parser("backtest", help="Backtest value strategy")
@@ -1691,6 +1890,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print a preview of top bets after backtest.",
     )
     p_bt.add_argument("--bets-limit", type=int, default=20, help="Rows to show in bet preview.")
+    _add_external_form_auto_ingest_arguments(p_bt)
     p_bt.set_defaults(func=cmd_backtest)
 
     p_score = sub.add_parser("score", help="Score today and output CSV")
@@ -1771,6 +1971,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_external_form_auto_ingest_arguments(p_score)
     _add_execution_domain_arguments(p_score, default_execution_domain="betfair")
     p_score.set_defaults(func=cmd_score)
 
@@ -1814,6 +2015,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_external_form_auto_ingest_arguments(p_pub)
     _add_execution_domain_arguments(p_pub, default_execution_domain="tab")
     p_pub.set_defaults(func=cmd_pub)
 
@@ -2127,6 +2329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--skip-train", action="store_true")
     p_pipe.add_argument("--skip-backtest", action="store_true")
     p_pipe.add_argument("--skip-score", action="store_true")
+    _add_external_form_auto_ingest_arguments(p_pipe)
     p_pipe.set_defaults(func=cmd_pipeline)
 
     p_go = sub.add_parser(
@@ -2148,6 +2351,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(set negative to disable stale-data auto-refresh)."
         ),
     )
+    _add_external_form_auto_ingest_arguments(p_go)
     p_go.set_defaults(func=cmd_go)
 
     p_repair = sub.add_parser(

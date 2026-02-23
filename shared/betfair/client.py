@@ -38,6 +38,18 @@ def _resolve_cert_files(cert_path: Optional[str], cert_file: Optional[str], key_
     return resolved_cert, resolved_key
 
 
+def _to_plain_metadata(metadata: Any) -> Dict[str, Any]:
+    """Normalize runner metadata payloads so downstream storage can rely on a plain dict."""
+    if isinstance(metadata, dict):
+        return metadata
+    if metadata is None:
+        return {}
+    try:
+        return dict(metadata)
+    except Exception:
+        return {}
+
+
 class BetfairClient:
     """Minimal Betfair API wrapper with a dry-run fallback so workflows can run without credentials."""
 
@@ -158,7 +170,8 @@ class BetfairClient:
                             "market_id": item.market_id,
                             "selection_id": runner.selection_id,
                             "runner_name": runner.runner_name,
-                            "stall_draw": runner.metadata.get("STALL_DRAW") if runner.metadata else None,
+                            "stall_draw": _to_plain_metadata(runner.metadata).get("STALL_DRAW"),
+                            "metadata": _to_plain_metadata(runner.metadata),
                         }
                         for runner in item.runners
                     ],
@@ -294,7 +307,25 @@ class BetfairClient:
                     "country_code": "AU",
                     "event_type": "horse_racing",
                     "runners": [
-                        {"market_id": market_id, "selection_id": 100 + j, "runner_name": f"Runner {j}", "stall_draw": j}
+                        {
+                            "market_id": market_id,
+                            "selection_id": 100 + j,
+                            "runner_name": f"Runner {j}",
+                            "stall_draw": j,
+                            "metadata": {
+                                "STALL_DRAW": j,
+                                "JOCKEY_NAME": f"Jockey {j}",
+                                "TRAINER_NAME": f"Trainer {j}",
+                                "AGE": 4 + (j % 3),
+                                "OFFICIAL_RATING": 70 + j,
+                                "ADJUSTED_RATING": 69 + j,
+                                "DAYS_SINCE_LAST_RUN": 7 + j,
+                                "WEIGHT_VALUE": 56.0 + (j * 0.5),
+                                "WEIGHT_UNITS": "kg",
+                                "JOCKEY_CLAIM": 0.0,
+                                "FORM": "123x",
+                            },
+                        }
                         for j in range(8)
                     ],
                 }

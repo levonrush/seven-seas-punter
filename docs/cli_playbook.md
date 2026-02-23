@@ -1,6 +1,7 @@
 # CLI Playbook
 
 This is the canonical runbook for day-to-day CLI usage.
+For modeling rationale behind the new form layers, see `docs/form_intelligence_layer.md`.
 
 ## Fast Paths
 One command (recommended default):
@@ -121,6 +122,24 @@ punter backtest --cutoff-minutes 10
 Report latest run:
 ```bash
 punter report
+```
+`punter report` now also prints latest runner-metadata completeness (when metadata snapshots exist).
+
+Capture prospective Betfair runner metadata snapshots (for form features):
+```bash
+punter download --date 2026-02-23
+```
+
+Ingest licensed external form runs (P1 form layer):
+```bash
+punter ingest-form --input data/external_form_runs.json --source punting_form
+```
+Auto-ingest is now default-on in `features/train/backtest/score/pipeline/go` when the external-form table is empty and a default file exists (`data/external_form_runs.parquet|csv|json|jsonl` or `data/external_form.json`).
+
+Disable per command when needed:
+```bash
+punter go --no-external-form-ingest
+punter pipeline --no-external-form-ingest
 ```
 
 ## Default Filter Behavior

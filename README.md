@@ -27,6 +27,7 @@ Pipeline for Betfair Exchange horse racing: download markets, snapshot odds, bui
 ## Read Next
 - Docs hub: `docs/README.md`
 - Run commands quickly: `docs/cli_playbook.md`
+- Form-intelligence architecture and leakage controls (P0/P1/P2): `docs/form_intelligence_layer.md`
 - Understand pub-mode theory (Betfair -> TAB): `docs/pub_domain_adaptation.md`
 - Live architecture notes: `docs/live_integration_plan.md`
 - Staking/Kelly theory and assumptions: `shared/backtest/README.md`

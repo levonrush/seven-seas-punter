@@ -20,6 +20,11 @@ This file is guidance for automated agents working in this repository.
 - Every function must have a docstring explaining why it exists + what it does.
 - Keep CLI scripts thin; put logic in `shared/`.
 
+## Default behavior policy
+- New capabilities should be enabled by default in relevant CLI commands.
+- Add explicit opt-out flags (`--no-...`) rather than requiring opt-in flags for newly developed features.
+- Preserve existing safety defaults unless the task explicitly says to change them.
+
 ## Logging and progress
 - Prefer existing progress/log helpers in `shared/utils/`.
 - Keep logs concise but informative (timestamps/durations already expected).

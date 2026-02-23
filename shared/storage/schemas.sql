@@ -16,6 +16,66 @@ CREATE TABLE IF NOT EXISTS runners (
     PRIMARY KEY (market_id, selection_id)
 );
 
+CREATE TABLE IF NOT EXISTS runner_metadata_snapshots (
+    market_id TEXT,
+    selection_id BIGINT,
+    snapshot_time TIMESTAMP,
+    race_start_time TIMESTAMP,
+    seconds_to_start INTEGER,
+    source TEXT,
+    runner_name TEXT,
+    jockey_name TEXT,
+    trainer_name TEXT,
+    age INTEGER,
+    official_rating DOUBLE,
+    adjusted_rating DOUBLE,
+    days_since_last_run INTEGER,
+    weight_value DOUBLE,
+    weight_units TEXT,
+    jockey_claim DOUBLE,
+    stall_draw INTEGER,
+    form_string TEXT,
+    metadata JSON
+);
+
+CREATE TABLE IF NOT EXISTS external_runner_form_runs (
+    source TEXT,
+    market_id TEXT,
+    selection_id BIGINT,
+    snapshot_time TIMESTAMP,
+    race_start_time TIMESTAMP,
+    seconds_to_start INTEGER,
+    run_index INTEGER,
+    runner_name TEXT,
+    horse_name TEXT,
+    jockey_name TEXT,
+    trainer_name TEXT,
+    track TEXT,
+    surface TEXT,
+    distance_m INTEGER,
+    class_label TEXT,
+    class_index DOUBLE,
+    track_condition TEXT,
+    run_date TIMESTAMP,
+    run_finish_pos INTEGER,
+    run_field_size INTEGER,
+    run_distance_m INTEGER,
+    run_surface TEXT,
+    run_track TEXT,
+    run_class_label TEXT,
+    run_class_index DOUBLE,
+    run_track_condition TEXT,
+    run_sectional_time DOUBLE,
+    run_speed_rating DOUBLE,
+    run_weight_value DOUBLE,
+    run_barrier INTEGER,
+    run_jockey_name TEXT,
+    run_trainer_name TEXT,
+    run_won BOOLEAN,
+    run_placed BOOLEAN,
+    metadata JSON
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     market_id TEXT,
     selection_id BIGINT,

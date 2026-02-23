@@ -3,6 +3,11 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added `docs/form_intelligence_layer.md` to document the end-to-end P0/P1/P2 form-intelligence rollout, including rationale for different modeling approaches and leakage safeguards.
+- Enabled external-form integration by default across `features`/`train`/`backtest`/`score`/`pipeline`/`go`: commands now auto-ingest from common `data/` form files when `external_runner_form_runs` is empty, with explicit opt-out via `--no-external-form-ingest`.
+- Added P2 form-intelligence features in the builder: leakage-safe pre-race Plackett-Luce top-m hierarchical ratings (horse + jockey + trainer + context components), with `place_position` ordering when available and winner-only fallback when not.
+- Added P1 external-form support: `ingest-form` CLI command, normalized external run-history ingestion (`shared/form/ingest.py`), `external_runner_form_runs` DuckDB table, external-form completeness reporting, and leakage-safe last-10/decayed/context-split/interaction features in the feature builder.
+- Added a leakage-safe form-intelligence P0 layer: point-in-time `runner_metadata_snapshots` storage, metadata completeness reporting in `punter report`, pre-race horse Elo + field-strength features, and conservative 365-day jockey/trainer rolling rates (min-history gated).
 - Switched calibration cross-fitting to time-aware windows aligned with rolling CV folds, with optional seeded within-window sampling (`--calibration-randomize-within-windows`, `--calibration-window-sample-fraction`, `--calibration-random-state`).
 - Made strategy/betting threshold rules opt-in across `train`, `backtest`, `score`, `pipeline`, and `go` defaults:
   filter flags now default to disabled, strategy tuning is now off by default, and tuned kappa thresholds are only used when explicitly requested.

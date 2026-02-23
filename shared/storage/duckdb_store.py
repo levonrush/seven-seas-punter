@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -113,6 +114,170 @@ class DuckDBStore:
                 ON CONFLICT (market_id, selection_id) DO UPDATE
                 SET runner_name=excluded.runner_name,
                     stall_draw=excluded.stall_draw
+                """
+            )
+
+    def append_runner_metadata_snapshots(self, snapshots: Iterable[Dict[str, Any]]) -> None:
+        """Persist point-in-time runner metadata so form features can be rebuilt exactly as seen pre-race."""
+        df = pd.DataFrame(list(snapshots))
+        if df.empty:
+            return
+        cols = [
+            "market_id",
+            "selection_id",
+            "snapshot_time",
+            "race_start_time",
+            "seconds_to_start",
+            "source",
+            "runner_name",
+            "jockey_name",
+            "trainer_name",
+            "age",
+            "official_rating",
+            "adjusted_rating",
+            "days_since_last_run",
+            "weight_value",
+            "weight_units",
+            "jockey_claim",
+            "stall_draw",
+            "form_string",
+            "metadata",
+        ]
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        df["metadata"] = df["metadata"].map(
+            lambda value: json.dumps(value) if isinstance(value, (dict, list)) else value
+        )
+        df = df[cols]
+        df = df.drop_duplicates(
+            subset=["market_id", "selection_id", "snapshot_time", "source"],
+            keep="last",
+        )
+        with self._connect() as con:
+            con.register("df", df)
+            con.execute(
+                """
+                INSERT INTO runner_metadata_snapshots (
+                    market_id,
+                    selection_id,
+                    snapshot_time,
+                    race_start_time,
+                    seconds_to_start,
+                    source,
+                    runner_name,
+                    jockey_name,
+                    trainer_name,
+                    age,
+                    official_rating,
+                    adjusted_rating,
+                    days_since_last_run,
+                    weight_value,
+                    weight_units,
+                    jockey_claim,
+                    stall_draw,
+                    form_string,
+                    metadata
+                )
+                SELECT * FROM df
+                """
+            )
+
+    def append_external_runner_form_runs(self, rows: Iterable[Dict[str, Any]]) -> None:
+        """Persist point-in-time external form runs so last-N/sectional features are reproducible at cutoff."""
+        df = pd.DataFrame(list(rows))
+        if df.empty:
+            return
+        cols = [
+            "source",
+            "market_id",
+            "selection_id",
+            "snapshot_time",
+            "race_start_time",
+            "seconds_to_start",
+            "run_index",
+            "runner_name",
+            "horse_name",
+            "jockey_name",
+            "trainer_name",
+            "track",
+            "surface",
+            "distance_m",
+            "class_label",
+            "class_index",
+            "track_condition",
+            "run_date",
+            "run_finish_pos",
+            "run_field_size",
+            "run_distance_m",
+            "run_surface",
+            "run_track",
+            "run_class_label",
+            "run_class_index",
+            "run_track_condition",
+            "run_sectional_time",
+            "run_speed_rating",
+            "run_weight_value",
+            "run_barrier",
+            "run_jockey_name",
+            "run_trainer_name",
+            "run_won",
+            "run_placed",
+            "metadata",
+        ]
+        for col in cols:
+            if col not in df.columns:
+                df[col] = None
+        df["metadata"] = df["metadata"].map(
+            lambda value: json.dumps(value) if isinstance(value, (dict, list)) else value
+        )
+        df = df[cols]
+        df = df.drop_duplicates(
+            subset=["source", "market_id", "selection_id", "snapshot_time", "run_index"],
+            keep="last",
+        )
+        with self._connect() as con:
+            con.register("df", df)
+            con.execute(
+                """
+                INSERT INTO external_runner_form_runs (
+                    source,
+                    market_id,
+                    selection_id,
+                    snapshot_time,
+                    race_start_time,
+                    seconds_to_start,
+                    run_index,
+                    runner_name,
+                    horse_name,
+                    jockey_name,
+                    trainer_name,
+                    track,
+                    surface,
+                    distance_m,
+                    class_label,
+                    class_index,
+                    track_condition,
+                    run_date,
+                    run_finish_pos,
+                    run_field_size,
+                    run_distance_m,
+                    run_surface,
+                    run_track,
+                    run_class_label,
+                    run_class_index,
+                    run_track_condition,
+                    run_sectional_time,
+                    run_speed_rating,
+                    run_weight_value,
+                    run_barrier,
+                    run_jockey_name,
+                    run_trainer_name,
+                    run_won,
+                    run_placed,
+                    metadata
+                )
+                SELECT * FROM df
                 """
             )
 
@@ -430,6 +595,233 @@ class DuckDBStore:
                 params,
             ).df()
 
+    def load_runner_metadata_for_cutoff(
+        self,
+        cutoff_minutes: int,
+        market_ids: Optional[Iterable[str]] = None,
+    ) -> pd.DataFrame:
+        """Load the latest pre-race metadata row per runner at/after cutoff for leakage-safe feature joins."""
+        cutoff_seconds = max(0, int(cutoff_minutes) * 60)
+        market_id_values = [str(value) for value in (market_ids or []) if str(value).strip()]
+        market_filter_sql = ""
+        params: list[Any] = [cutoff_seconds]
+        if market_id_values:
+            placeholders = ", ".join(["?"] * len(market_id_values))
+            market_filter_sql = f" AND market_id IN ({placeholders})"
+            params.extend(market_id_values)
+        with self._connect() as con:
+            return con.execute(
+                f"""
+                WITH eligible AS (
+                    SELECT
+                        market_id,
+                        selection_id,
+                        snapshot_time,
+                        race_start_time,
+                        seconds_to_start,
+                        source,
+                        runner_name,
+                        jockey_name,
+                        trainer_name,
+                        age,
+                        official_rating,
+                        adjusted_rating,
+                        days_since_last_run,
+                        weight_value,
+                        weight_units,
+                        jockey_claim,
+                        stall_draw,
+                        form_string,
+                        metadata,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY market_id, selection_id
+                            ORDER BY seconds_to_start ASC, snapshot_time DESC
+                        ) AS row_num
+                    FROM runner_metadata_snapshots
+                    WHERE snapshot_time IS NOT NULL
+                      AND race_start_time IS NOT NULL
+                      AND snapshot_time < race_start_time
+                      AND seconds_to_start >= ?
+                      {market_filter_sql}
+                )
+                SELECT
+                    market_id,
+                    selection_id,
+                    snapshot_time,
+                    race_start_time,
+                    seconds_to_start,
+                    source,
+                    runner_name,
+                    jockey_name,
+                    trainer_name,
+                    age,
+                    official_rating,
+                    adjusted_rating,
+                    days_since_last_run,
+                    weight_value,
+                    weight_units,
+                    jockey_claim,
+                    stall_draw,
+                    form_string,
+                    metadata
+                FROM eligible
+                WHERE row_num = 1
+                """,
+                params,
+            ).df()
+
+    def load_runner_metadata_completeness(self) -> pd.DataFrame:
+        """Summarize per-day metadata coverage so drift in optional Betfair fields is easy to monitor."""
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT
+                    CAST(snapshot_time AS DATE) AS snapshot_date,
+                    COUNT(*) AS row_count,
+                    AVG(CASE WHEN jockey_name IS NOT NULL THEN 1.0 ELSE 0.0 END) AS jockey_name_coverage,
+                    AVG(CASE WHEN trainer_name IS NOT NULL THEN 1.0 ELSE 0.0 END) AS trainer_name_coverage,
+                    AVG(CASE WHEN age IS NOT NULL THEN 1.0 ELSE 0.0 END) AS age_coverage,
+                    AVG(CASE WHEN official_rating IS NOT NULL THEN 1.0 ELSE 0.0 END) AS official_rating_coverage,
+                    AVG(CASE WHEN adjusted_rating IS NOT NULL THEN 1.0 ELSE 0.0 END) AS adjusted_rating_coverage,
+                    AVG(CASE WHEN days_since_last_run IS NOT NULL THEN 1.0 ELSE 0.0 END) AS days_since_last_run_coverage,
+                    AVG(CASE WHEN weight_value IS NOT NULL THEN 1.0 ELSE 0.0 END) AS weight_value_coverage,
+                    AVG(CASE WHEN jockey_claim IS NOT NULL THEN 1.0 ELSE 0.0 END) AS jockey_claim_coverage,
+                    AVG(CASE WHEN stall_draw IS NOT NULL THEN 1.0 ELSE 0.0 END) AS stall_draw_coverage,
+                    AVG(CASE WHEN form_string IS NOT NULL THEN 1.0 ELSE 0.0 END) AS form_string_coverage
+                FROM runner_metadata_snapshots
+                GROUP BY 1
+                ORDER BY 1 DESC
+                """
+            ).df()
+
+    def load_external_runner_form_for_cutoff(
+        self,
+        cutoff_minutes: int,
+        market_ids: Optional[Iterable[str]] = None,
+    ) -> pd.DataFrame:
+        """Load latest eligible external run-history rows per runner+run index at or before inference cutoff."""
+        cutoff_seconds = max(0, int(cutoff_minutes) * 60)
+        market_id_values = [str(value) for value in (market_ids or []) if str(value).strip()]
+        market_filter_sql = ""
+        params: list[Any] = [cutoff_seconds]
+        if market_id_values:
+            placeholders = ", ".join(["?"] * len(market_id_values))
+            market_filter_sql = f" AND market_id IN ({placeholders})"
+            params.extend(market_id_values)
+        with self._connect() as con:
+            return con.execute(
+                f"""
+                WITH eligible AS (
+                    SELECT
+                        source,
+                        market_id,
+                        selection_id,
+                        snapshot_time,
+                        race_start_time,
+                        seconds_to_start,
+                        run_index,
+                        runner_name,
+                        horse_name,
+                        jockey_name,
+                        trainer_name,
+                        track,
+                        surface,
+                        distance_m,
+                        class_label,
+                        class_index,
+                        track_condition,
+                        run_date,
+                        run_finish_pos,
+                        run_field_size,
+                        run_distance_m,
+                        run_surface,
+                        run_track,
+                        run_class_label,
+                        run_class_index,
+                        run_track_condition,
+                        run_sectional_time,
+                        run_speed_rating,
+                        run_weight_value,
+                        run_barrier,
+                        run_jockey_name,
+                        run_trainer_name,
+                        run_won,
+                        run_placed,
+                        metadata,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY market_id, selection_id, run_index
+                            ORDER BY seconds_to_start ASC, snapshot_time DESC
+                        ) AS row_num
+                    FROM external_runner_form_runs
+                    WHERE snapshot_time IS NOT NULL
+                      AND race_start_time IS NOT NULL
+                      AND snapshot_time < race_start_time
+                      AND seconds_to_start >= ?
+                      {market_filter_sql}
+                )
+                SELECT
+                    source,
+                    market_id,
+                    selection_id,
+                    snapshot_time,
+                    race_start_time,
+                    seconds_to_start,
+                    run_index,
+                    runner_name,
+                    horse_name,
+                    jockey_name,
+                    trainer_name,
+                    track,
+                    surface,
+                    distance_m,
+                    class_label,
+                    class_index,
+                    track_condition,
+                    run_date,
+                    run_finish_pos,
+                    run_field_size,
+                    run_distance_m,
+                    run_surface,
+                    run_track,
+                    run_class_label,
+                    run_class_index,
+                    run_track_condition,
+                    run_sectional_time,
+                    run_speed_rating,
+                    run_weight_value,
+                    run_barrier,
+                    run_jockey_name,
+                    run_trainer_name,
+                    run_won,
+                    run_placed,
+                    metadata
+                FROM eligible
+                WHERE row_num = 1
+                """,
+                params,
+            ).df()
+
+    def load_external_runner_form_completeness(self) -> pd.DataFrame:
+        """Summarize per-day external-form coverage so upstream provider drift can be monitored."""
+        with self._connect() as con:
+            return con.execute(
+                """
+                SELECT
+                    CAST(snapshot_time AS DATE) AS snapshot_date,
+                    COUNT(*) AS row_count,
+                    AVG(CASE WHEN run_date IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_date_coverage,
+                    AVG(CASE WHEN run_finish_pos IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_finish_pos_coverage,
+                    AVG(CASE WHEN run_distance_m IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_distance_coverage,
+                    AVG(CASE WHEN run_surface IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_surface_coverage,
+                    AVG(CASE WHEN run_track IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_track_coverage,
+                    AVG(CASE WHEN run_sectional_time IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_sectional_coverage,
+                    AVG(CASE WHEN run_speed_rating IS NOT NULL THEN 1.0 ELSE 0.0 END) AS run_speed_rating_coverage
+                FROM external_runner_form_runs
+                GROUP BY 1
+                ORDER BY 1 DESC
+                """
+            ).df()
+
     def load_results(self) -> pd.DataFrame:
         """Return stored results to build targets."""
         with self._connect() as con:
@@ -442,11 +834,6 @@ class DuckDBStore:
 
     def load_runners(self) -> pd.DataFrame:
         """Return stored runners for reporting and joins."""
-        with self._connect() as con:
-            return con.execute("SELECT * FROM runners").df()
-
-    def load_runners(self) -> pd.DataFrame:
-        """Return stored runners for joins."""
         with self._connect() as con:
             return con.execute("SELECT * FROM runners").df()
 

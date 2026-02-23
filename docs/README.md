@@ -9,6 +9,8 @@ Use this folder as the primary docs entrypoint. Top-level and module READMEs sta
 
 ## By Task
 - Run commands end-to-end: `docs/cli_playbook.md`
+- Ingest licensed external form snapshots (P1): `docs/cli_playbook.md`
+- Understand the full form-intelligence architecture and leakage controls (P0/P1/P2): `docs/form_intelligence_layer.md`
 - Understand live integration constraints and architecture: `docs/live_integration_plan.md`
 - Understand pub-mode domain adaptation (Betfair -> TAB): `docs/pub_domain_adaptation.md`
 - Review staking and Kelly assumptions: `shared/backtest/README.md`
