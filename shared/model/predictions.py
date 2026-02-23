@@ -18,6 +18,18 @@ def _select_price(feature_row: pd.Series, cutoff_minutes: int) -> float | None:
     return None
 
 
+def _coalesce_market_columns(preview: pd.DataFrame) -> pd.DataFrame:
+    """Prefer feature-time market metadata and fill gaps from merged market table columns."""
+    merged = preview.copy()
+    for col in ["venue", "race_start_time", "market_type"]:
+        market_col = f"{col}_market"
+        if market_col not in merged.columns:
+            continue
+        merged[col] = merged[col].combine_first(merged[market_col])
+        merged = merged.drop(columns=[market_col])
+    return merged
+
+
 def build_prediction_preview(
     feature_df: pd.DataFrame,
     probs: pd.Series,
@@ -76,7 +88,9 @@ def build_prediction_preview(
             markets[["market_id", "venue", "race_start_time", "market_type"]],
             on="market_id",
             how="left",
+            suffixes=("", "_market"),
         )
+        preview = _coalesce_market_columns(preview)
 
     if "runner_name" in preview.columns:
         preview["selection"] = preview["runner_name"].fillna(preview["selection_id"].astype(str))
