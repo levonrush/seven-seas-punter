@@ -15,6 +15,11 @@ from shared.utils.cli_presets import (
     go_pipeline_args,
     recommended_historic_workers,
 )
+from shared.model.training import (
+    DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    DEFAULT_CALIBRATION_RANDOM_STATE,
+    DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+)
 from workflow.cli import build_parser, cmd_go, cmd_repair_manifests
 
 
@@ -229,3 +234,79 @@ def test_parser_go_refresh_historic_default_is_false():
     args = parser.parse_args(["go"])
     assert args.refresh_historic is False
     assert args.refresh_historic_if_stale_days == go_historic_stale_days_default()
+
+
+def test_parser_train_calibration_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["train"])
+    assert args.calibration_randomize_within_windows is DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS
+    assert args.calibration_window_sample_fraction == DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION
+    assert args.calibration_random_state == DEFAULT_CALIBRATION_RANDOM_STATE
+
+
+def test_parser_train_filters_default_to_opt_in():
+    parser = build_parser()
+    args = parser.parse_args(["train"])
+    assert args.preds_min_ev is None
+    assert args.preds_min_edge is None
+    assert args.preds_min_prob is None
+    assert args.preds_max_price is None
+    assert args.preds_max_edge_mult is None
+    assert args.preds_use_kappa_threshold is False
+    assert args.tune_strategy is False
+    assert args.strategy_min_prob is None
+
+
+def test_parser_backtest_filters_default_to_opt_in():
+    parser = build_parser()
+    args = parser.parse_args(["backtest"])
+    assert args.min_ev is None
+    assert args.min_edge is None
+    assert args.max_spread is None
+    assert args.max_price is None
+    assert args.max_edge_mult is None
+    assert args.min_prob is None
+    assert args.use_kappa_thresholds is False
+    assert args.use_market_type_kappa_thresholds is False
+
+
+def test_parser_score_filters_default_to_opt_in():
+    parser = build_parser()
+    args = parser.parse_args(["score"])
+    assert args.min_ev is None
+    assert args.min_edge is None
+    assert args.max_spread is None
+    assert args.max_price is None
+    assert args.max_edge_mult is None
+    assert args.min_prob is None
+    assert args.use_kappa_thresholds is False
+    assert args.use_market_type_kappa_thresholds is False
+
+
+def test_parser_pipeline_calibration_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["pipeline"])
+    assert args.calibration_randomize_within_windows is DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS
+    assert args.calibration_window_sample_fraction == DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION
+    assert args.calibration_random_state == DEFAULT_CALIBRATION_RANDOM_STATE
+
+
+def test_parser_pipeline_filters_default_to_opt_in():
+    parser = build_parser()
+    args = parser.parse_args(["pipeline"])
+    assert args.min_ev is None
+    assert args.min_edge is None
+    assert args.max_spread is None
+    assert args.max_price is None
+    assert args.max_edge_mult is None
+    assert args.min_prob is None
+    assert args.use_kappa_thresholds is False
+    assert args.use_market_type_kappa_thresholds is False
+    assert args.preds_min_ev is None
+    assert args.preds_min_edge is None
+    assert args.preds_min_prob is None
+    assert args.preds_max_price is None
+    assert args.preds_max_edge_mult is None
+    assert args.preds_use_kappa_threshold is False
+    assert args.tune_strategy is False
+    assert args.strategy_min_prob is None

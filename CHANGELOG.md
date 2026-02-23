@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Switched calibration cross-fitting to time-aware windows aligned with rolling CV folds, with optional seeded within-window sampling (`--calibration-randomize-within-windows`, `--calibration-window-sample-fraction`, `--calibration-random-state`).
+- Made strategy/betting threshold rules opt-in across `train`, `backtest`, `score`, `pipeline`, and `go` defaults:
+  filter flags now default to disabled, strategy tuning is now off by default, and tuned kappa thresholds are only used when explicitly requested.
 - `punter go` now auto-skips `download-historic` when snapshots are fresh, auto-refreshes when latest snapshots are stale (default 30 days), and supports `--refresh-historic` / `--refresh-historic-if-stale-days`.
 - Hardened historic download manifest loading to recover from empty/corrupt JSON (with timestamped `.bad_*` backups) instead of crashing `punter go`.
 - Restricted `score`/`pub` feature generation to fetched market ids so daily scoring no longer re-scores historical markets.
@@ -57,7 +60,7 @@ All notable changes to this project will be documented in this file.
 - Added bet guidance hints and clearer labels when market_type looks like a numeric event id.
 - Truncated long preview text columns to keep console tables aligned, keeping *_full columns for exports.
 - Added strategy tuning to optimize betting filters for ROI with hit-rate constraints and trade-off summary.
-- Enabled strategy tuning by default with `--no-tune-strategy` to opt out.
+- Added strategy tuning controls with `--tune-strategy` / `--no-tune-strategy`.
 - Added tick-normalized odds/spread features and overround aliases for exchange-style modeling.
 - Strategy tuning now sweeps `min_prob` cutoffs and reports them in the hit-rate trade-off summary.
 - Added market-type model bundles with a global fallback, plus Plackett-Luce normalization for WIN markets.

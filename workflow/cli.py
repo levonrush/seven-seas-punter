@@ -14,7 +14,14 @@ from shared.features.builder import build_features_from_store, split_features_by
 from shared.model.market_type import bucket_market_type
 from shared.model.predictions import build_prediction_preview
 from shared.model.tab_translation import estimate_tab_odds_quantiles, quantile_to_column
-from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
+from shared.model.training import (
+    DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    DEFAULT_CALIBRATION_RANDOM_STATE,
+    DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+    load_model_and_calibrator,
+    predict_probabilities,
+    train_and_calibrate,
+)
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.cli_presets import (
@@ -271,9 +278,11 @@ def _load_model_metrics(args: argparse.Namespace, store: DuckDBStore) -> dict | 
 
 
 def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | None:
-    """Load the tuned global kappa threshold from model runs unless overridden."""
+    """Resolve the active min-prob threshold, only using tuned kappa when explicitly requested."""
     if getattr(args, "min_prob", None) is not None:
         return float(args.min_prob)
+    if not getattr(args, "use_kappa_thresholds", False):
+        return None
     metrics = _load_model_metrics(args, store)
     if not metrics:
         return None
@@ -284,8 +293,10 @@ def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | N
 
 
 def _resolve_market_type_min_probs(args: argparse.Namespace, store: DuckDBStore) -> dict[str, float]:
-    """Load per-market-type min-prob thresholds from model metrics when available."""
+    """Resolve per-market-type min-prob thresholds when explicitly requested."""
     if getattr(args, "min_prob", None) is not None:
+        return {}
+    if not getattr(args, "use_market_type_kappa_thresholds", False):
         return {}
     metrics = _load_model_metrics(args, store)
     if not metrics:
@@ -422,8 +433,8 @@ def _select_score_price(feature_row: pd.Series, cutoff_minutes: int) -> float | 
 def _apply_score_strategy_filters(
     frame: pd.DataFrame,
     cutoff_minutes: int,
-    min_ev: float,
-    min_edge: float,
+    min_ev: float | None,
+    min_edge: float | None,
     max_price: float | None,
     max_edge_multiplier: float | None,
     max_spread: float | None,
@@ -437,8 +448,10 @@ def _apply_score_strategy_filters(
     filtered["edge_multiplier"] = filtered["p_hat"] / filtered["implied_prob"]
 
     before = len(filtered)
-    filtered = filtered[filtered["ev"] >= min_ev]
-    filtered = filtered[filtered["edge_pct"] >= min_edge]
+    if min_ev is not None:
+        filtered = filtered[filtered["ev"] >= min_ev]
+    if min_edge is not None:
+        filtered = filtered[filtered["edge_pct"] >= min_edge]
     if max_price is not None:
         filtered = filtered[filtered["decision_price"] <= max_price]
     if max_edge_multiplier is not None:
@@ -506,11 +519,31 @@ def cmd_train(args: argparse.Namespace) -> None:
     if train_features.empty:
         log("Training: no features available after split; skipping.")
         return
+    sample_fraction = float(
+        getattr(
+            args,
+            "calibration_window_sample_fraction",
+            DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+        )
+    )
+    if sample_fraction <= 0.0 or sample_fraction > 1.0:
+        raise ValueError("--calibration-window-sample-fraction must be in the range (0, 1].")
     model_path, calibrator_path, metrics, oof_predictions = train_and_calibrate(
         features_df=train_features,
         cutoff_minutes=args.cutoff_minutes,
         store=store,
         split_date=getattr(args, "split_date", None),
+        calibration_randomize_within_windows=getattr(
+            args,
+            "calibration_randomize_within_windows",
+            DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+        ),
+        calibration_window_sample_fraction=sample_fraction,
+        calibration_random_state=getattr(
+            args,
+            "calibration_random_state",
+            DEFAULT_CALIBRATION_RANDOM_STATE,
+        ),
         run_id=getattr(args, "run_id", None),
     )
     log(f"Model saved: {model_path}, calibrator: {calibrator_path}, metrics: {metrics}")
@@ -518,9 +551,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         tuned_min_prob = None
         if isinstance(metrics, dict):
             tuned_min_prob = metrics.get("kappa_threshold")
-        preview_min_prob = (
-            args.preds_min_prob if getattr(args, "preds_min_prob", None) is not None else tuned_min_prob
-        )
+        preview_min_prob = getattr(args, "preds_min_prob", None)
+        if preview_min_prob is None and getattr(args, "preds_use_kappa_threshold", False):
+            preview_min_prob = tuned_min_prob
         if preview_min_prob is not None:
             log(f"Prediction preview: using min_prob={preview_min_prob:.3f}.")
         if oof_predictions is not None:
@@ -565,8 +598,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         else:
             tuning_features = train_features.loc[oof_predictions.index]
             commission = getattr(args, "commission", 0.05)
-            strategy_min_prob = getattr(args, "min_prob", None)
+            strategy_min_prob = getattr(args, "strategy_min_prob", None)
             if strategy_min_prob is None:
+                strategy_min_prob = getattr(args, "min_prob", None)
+            if strategy_min_prob is None and getattr(args, "use_kappa_thresholds", False):
                 strategy_min_prob = tuned_min_prob
             results, tradeoff = tune_strategy(
                 feature_df=tuning_features,
@@ -829,11 +864,11 @@ def cmd_score(args: argparse.Namespace) -> None:
     features = _apply_score_strategy_filters(
         frame=features,
         cutoff_minutes=args.cutoff_minutes,
-        min_ev=float(getattr(args, "min_ev", 0.02)),
-        min_edge=float(getattr(args, "min_edge", 0.1)),
-        max_price=getattr(args, "max_price", 200.0),
-        max_edge_multiplier=getattr(args, "max_edge_mult", 5.0),
-        max_spread=getattr(args, "max_spread", 1.0),
+        min_ev=getattr(args, "min_ev", None),
+        min_edge=getattr(args, "min_edge", None),
+        max_price=getattr(args, "max_price", None),
+        max_edge_multiplier=getattr(args, "max_edge_mult", None),
+        max_spread=getattr(args, "max_spread", None),
     )
     if features.empty:
         log("Score: no rows remain after strategy filters.")
@@ -1464,21 +1499,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Rows to show in the prediction preview.",
     )
-    p_train.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
     p_train.add_argument(
-        "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+        "--preds-min-ev",
+        type=float,
+        default=None,
+        help="Optional min EV for preview rows (disabled by default).",
+    )
+    p_train.add_argument(
+        "--preds-min-edge",
+        type=float,
+        default=None,
+        help="Optional min edge (relative) for preview rows (disabled by default).",
     )
     p_train.add_argument(
         "--preds-min-prob",
         type=float,
-        help="Optional min probability for preview rows (defaults to tuned kappa threshold).",
+        help="Optional min probability for preview rows.",
     )
-    p_train.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
+    p_train.add_argument(
+        "--preds-use-kappa-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the tuned kappa threshold for preview min-prob when --preds-min-prob "
+            "is not set (disabled by default)."
+        ),
+    )
+    p_train.add_argument(
+        "--preds-max-price",
+        type=float,
+        default=None,
+        help="Optional max price to show (disabled by default).",
+    )
     p_train.add_argument(
         "--preds-max-edge-mult",
         type=float,
-        default=5.0,
-        help="Max multiple of market implied prob to show.",
+        default=None,
+        help="Optional max multiple of market implied prob to show (disabled by default).",
     )
     p_train.add_argument(
         "--preds-per-market",
@@ -1495,8 +1552,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument(
         "--tune-strategy",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Tune betting filters on out-of-fold predictions (use --no-tune-strategy to disable).",
+        default=False,
+        help="Tune betting filters on out-of-fold predictions (disabled by default).",
     )
     p_train.add_argument(
         "--strategy-grid",
@@ -1523,6 +1580,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum number of bets required for tuned configs.",
     )
     p_train.add_argument(
+        "--strategy-min-prob",
+        type=float,
+        help="Optional min probability filter applied while strategy tuning.",
+    )
+    p_train.add_argument(
         "--strategy-top-n",
         type=int,
         default=10,
@@ -1538,6 +1600,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--strategy-output",
         help="Optional CSV path to write strategy tuning results.",
     )
+    p_train.add_argument(
+        "--calibration-randomize-within-windows",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+        help="When time-aware calibration is available, randomly subsample within each past time window.",
+    )
+    p_train.add_argument(
+        "--calibration-window-sample-fraction",
+        type=float,
+        default=DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+        help=(
+            "Fraction of rows to sample inside each calibration time window "
+            "(0..1, only used when --calibration-randomize-within-windows)."
+        ),
+    )
+    p_train.add_argument(
+        "--calibration-random-state",
+        type=int,
+        default=DEFAULT_CALIBRATION_RANDOM_STATE,
+        help="Random seed for within-window calibration sampling.",
+    )
     p_train.set_defaults(func=cmd_train)
 
     p_bt = sub.add_parser("backtest", help="Backtest value strategy")
@@ -1551,15 +1634,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_bt.add_argument("--commission", type=float, default=0.05)
-    p_bt.add_argument("--min-ev", type=float, default=0.02)
-    p_bt.add_argument("--min-edge", type=float, default=0.1)
-    p_bt.add_argument("--max-spread", type=float, default=1.0)
-    p_bt.add_argument("--max-price", type=float, default=200.0)
-    p_bt.add_argument("--max-edge-mult", type=float, default=5.0)
+    p_bt.add_argument("--min-ev", type=float, default=None)
+    p_bt.add_argument("--min-edge", type=float, default=None)
+    p_bt.add_argument("--max-spread", type=float, default=None)
+    p_bt.add_argument("--max-price", type=float, default=None)
+    p_bt.add_argument("--max-edge-mult", type=float, default=None)
     p_bt.add_argument(
         "--min-prob",
         type=float,
-        help="Optional min probability to bet (defaults to tuned kappa threshold).",
+        help="Optional global min probability to bet.",
+    )
+    p_bt.add_argument(
+        "--use-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the latest tuned global kappa threshold as min-prob (disabled by default).",
+    )
+    p_bt.add_argument(
+        "--use-market-type-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use latest per-market-type tuned kappa thresholds as min-prob routing "
+            "(disabled by default)."
+        ),
     )
     p_bt.add_argument("--stake", type=float, default=1.0)
     p_bt.add_argument("--model-path")
@@ -1607,17 +1705,52 @@ def build_parser() -> argparse.ArgumentParser:
     p_score.add_argument(
         "--min-prob",
         type=float,
-        help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
+        help="Optional global min probability to include in scoring.",
     )
-    p_score.add_argument("--min-ev", type=float, default=0.02, help="Min expected value filter for scored rows.")
-    p_score.add_argument("--min-edge", type=float, default=0.1, help="Min edge filter for scored rows.")
-    p_score.add_argument("--max-spread", type=float, default=1.0, help="Max spread filter for scored rows.")
-    p_score.add_argument("--max-price", type=float, default=200.0, help="Max decision price for scored rows.")
+    p_score.add_argument(
+        "--use-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the latest tuned global kappa threshold as min-prob (disabled by default).",
+    )
+    p_score.add_argument(
+        "--use-market-type-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use latest per-market-type tuned kappa thresholds as min-prob routing "
+            "(disabled by default)."
+        ),
+    )
+    p_score.add_argument(
+        "--min-ev",
+        type=float,
+        default=None,
+        help="Optional min expected value filter for scored rows.",
+    )
+    p_score.add_argument(
+        "--min-edge",
+        type=float,
+        default=None,
+        help="Optional min edge filter for scored rows.",
+    )
+    p_score.add_argument(
+        "--max-spread",
+        type=float,
+        default=None,
+        help="Optional max spread filter for scored rows.",
+    )
+    p_score.add_argument(
+        "--max-price",
+        type=float,
+        default=None,
+        help="Optional max decision price for scored rows.",
+    )
     p_score.add_argument(
         "--max-edge-mult",
         type=float,
-        default=5.0,
-        help="Max implied-probability multiplier for scored rows.",
+        default=None,
+        help="Optional max implied-probability multiplier for scored rows.",
     )
     p_score.add_argument("--budget", type=float, help="Optional day budget for stake allocation.")
     p_score.add_argument(
@@ -1799,15 +1932,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_pipe.add_argument("--commission", type=float, default=0.05)
-    p_pipe.add_argument("--min-ev", type=float, default=0.02)
-    p_pipe.add_argument("--min-edge", type=float, default=0.1)
-    p_pipe.add_argument("--max-spread", type=float, default=1.0)
-    p_pipe.add_argument("--max-price", type=float, default=200.0)
-    p_pipe.add_argument("--max-edge-mult", type=float, default=5.0)
+    p_pipe.add_argument("--min-ev", type=float, default=None)
+    p_pipe.add_argument("--min-edge", type=float, default=None)
+    p_pipe.add_argument("--max-spread", type=float, default=None)
+    p_pipe.add_argument("--max-price", type=float, default=None)
+    p_pipe.add_argument("--max-edge-mult", type=float, default=None)
     p_pipe.add_argument(
         "--min-prob",
         type=float,
-        help="Optional min probability to bet (defaults to tuned kappa threshold).",
+        help="Optional global min probability to bet.",
+    )
+    p_pipe.add_argument(
+        "--use-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the latest tuned global kappa threshold as min-prob (disabled by default).",
+    )
+    p_pipe.add_argument(
+        "--use-market-type-kappa-thresholds",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use latest per-market-type tuned kappa thresholds as min-prob routing "
+            "(disabled by default)."
+        ),
     )
     p_pipe.add_argument("--stake", type=float, default=1.0)
     p_pipe.add_argument(
@@ -1844,21 +1992,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Rows to show in the prediction preview.",
     )
-    p_pipe.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
     p_pipe.add_argument(
-        "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+        "--preds-min-ev",
+        type=float,
+        default=None,
+        help="Optional min EV for preview rows (disabled by default).",
+    )
+    p_pipe.add_argument(
+        "--preds-min-edge",
+        type=float,
+        default=None,
+        help="Optional min edge (relative) for preview rows (disabled by default).",
     )
     p_pipe.add_argument(
         "--preds-min-prob",
         type=float,
-        help="Optional min probability for preview rows (defaults to tuned kappa threshold).",
+        help="Optional min probability for preview rows.",
     )
-    p_pipe.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
+    p_pipe.add_argument(
+        "--preds-use-kappa-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the tuned kappa threshold for preview min-prob when --preds-min-prob "
+            "is not set (disabled by default)."
+        ),
+    )
+    p_pipe.add_argument(
+        "--preds-max-price",
+        type=float,
+        default=None,
+        help="Optional max price to show (disabled by default).",
+    )
     p_pipe.add_argument(
         "--preds-max-edge-mult",
         type=float,
-        default=5.0,
-        help="Max multiple of market implied prob to show.",
+        default=None,
+        help="Optional max multiple of market implied prob to show (disabled by default).",
     )
     p_pipe.add_argument(
         "--preds-per-market",
@@ -1882,8 +2052,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument(
         "--tune-strategy",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Tune betting filters on out-of-fold predictions (use --no-tune-strategy to disable).",
+        default=False,
+        help="Tune betting filters on out-of-fold predictions (disabled by default).",
     )
     p_pipe.add_argument(
         "--strategy-grid",
@@ -1910,6 +2080,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum number of bets required for tuned configs.",
     )
     p_pipe.add_argument(
+        "--strategy-min-prob",
+        type=float,
+        help="Optional min probability filter applied while strategy tuning.",
+    )
+    p_pipe.add_argument(
         "--strategy-top-n",
         type=int,
         default=10,
@@ -1924,6 +2099,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument(
         "--strategy-output",
         help="Optional CSV path to write strategy tuning results.",
+    )
+    p_pipe.add_argument(
+        "--calibration-randomize-within-windows",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+        help="When time-aware calibration is available, randomly subsample within each past time window.",
+    )
+    p_pipe.add_argument(
+        "--calibration-window-sample-fraction",
+        type=float,
+        default=DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+        help=(
+            "Fraction of rows to sample inside each calibration time window "
+            "(0..1, only used when --calibration-randomize-within-windows)."
+        ),
+    )
+    p_pipe.add_argument(
+        "--calibration-random-state",
+        type=int,
+        default=DEFAULT_CALIBRATION_RANDOM_STATE,
+        help="Random seed for within-window calibration sampling.",
     )
     p_pipe.add_argument("--output")
     p_pipe.add_argument("--dry-run", action="store_true", help="Applied to scoring step")

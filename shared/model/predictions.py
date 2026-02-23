@@ -37,10 +37,10 @@ def build_prediction_preview(
     runners: pd.DataFrame | None = None,
     markets: pd.DataFrame | None = None,
     limit: int = 20,
-    min_ev: float = 0.02,
-    min_edge: float = 0.1,
-    max_price: float = 200.0,
-    max_edge_multiplier: float = 5.0,
+    min_ev: float | None = None,
+    min_edge: float | None = None,
+    max_price: float | None = None,
+    max_edge_multiplier: float | None = None,
     per_market_limit: int | None = 1,
     commission: float = 0.05,
     min_prob: float | None = None,
@@ -68,8 +68,10 @@ def build_prediction_preview(
     preview["edge_pct"] = (preview["p_hat"] - preview["implied_prob"]) / preview["implied_prob"]
     preview["edge_multiplier"] = preview["p_hat"] / preview["implied_prob"]
 
-    preview = preview[preview["expected_value"] >= min_ev]
-    preview = preview[preview["edge_pct"] >= min_edge]
+    if min_ev is not None:
+        preview = preview[preview["expected_value"] >= min_ev]
+    if min_edge is not None:
+        preview = preview[preview["edge_pct"] >= min_edge]
     if max_price is not None:
         preview = preview[preview["price"] <= max_price]
     if max_edge_multiplier is not None:

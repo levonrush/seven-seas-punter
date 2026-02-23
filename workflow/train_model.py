@@ -5,7 +5,14 @@ import pathlib
 from shared.backtest.strategy_tuner import tune_strategy
 from shared.features.builder import build_features_from_store, split_features_by_race_time
 from shared.model.predictions import build_prediction_preview
-from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
+from shared.model.training import (
+    DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    DEFAULT_CALIBRATION_RANDOM_STATE,
+    DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+    load_model_and_calibrator,
+    predict_probabilities,
+    train_and_calibrate,
+)
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
 from shared.utils.progress import log
@@ -37,16 +44,29 @@ def main() -> None:
         default=20,
         help="Rows to show in the prediction preview.",
     )
-    parser.add_argument("--preds-min-ev", type=float, default=0.02, help="Min EV for preview rows.")
     parser.add_argument(
-        "--preds-min-edge", type=float, default=0.1, help="Min edge (relative) for preview rows."
+        "--preds-min-ev",
+        type=float,
+        default=None,
+        help="Optional min EV for preview rows (disabled by default).",
     )
-    parser.add_argument("--preds-max-price", type=float, default=200.0, help="Max price to show.")
+    parser.add_argument(
+        "--preds-min-edge",
+        type=float,
+        default=None,
+        help="Optional min edge (relative) for preview rows (disabled by default).",
+    )
+    parser.add_argument(
+        "--preds-max-price",
+        type=float,
+        default=None,
+        help="Optional max price to show (disabled by default).",
+    )
     parser.add_argument(
         "--preds-max-edge-mult",
         type=float,
-        default=5.0,
-        help="Max multiple of market implied prob to show.",
+        default=None,
+        help="Optional max multiple of market implied prob to show (disabled by default).",
     )
     parser.add_argument(
         "--preds-per-market",
@@ -63,8 +83,8 @@ def main() -> None:
     parser.add_argument(
         "--tune-strategy",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Tune betting filters on out-of-fold predictions (use --no-tune-strategy to disable).",
+        default=False,
+        help="Tune betting filters on out-of-fold predictions (disabled by default).",
     )
     parser.add_argument(
         "--strategy-grid",
@@ -91,6 +111,11 @@ def main() -> None:
         help="Minimum number of bets required for tuned configs.",
     )
     parser.add_argument(
+        "--strategy-min-prob",
+        type=float,
+        help="Optional min probability filter applied while strategy tuning.",
+    )
+    parser.add_argument(
         "--strategy-top-n",
         type=int,
         default=10,
@@ -105,6 +130,27 @@ def main() -> None:
     parser.add_argument(
         "--strategy-output",
         help="Optional CSV path to write strategy tuning results.",
+    )
+    parser.add_argument(
+        "--calibration-randomize-within-windows",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+        help="When time-aware calibration is available, randomly subsample within each past time window.",
+    )
+    parser.add_argument(
+        "--calibration-window-sample-fraction",
+        type=float,
+        default=DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+        help=(
+            "Fraction of rows to sample inside each calibration time window "
+            "(0..1, only used when --calibration-randomize-within-windows)."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-random-state",
+        type=int,
+        default=DEFAULT_CALIBRATION_RANDOM_STATE,
+        help="Random seed for within-window calibration sampling.",
     )
     args = parser.parse_args()
 
@@ -121,11 +167,17 @@ def main() -> None:
     if train_features.empty:
         log("Train: no features available after split; skipping.")
         return
+    sample_fraction = float(args.calibration_window_sample_fraction)
+    if sample_fraction <= 0.0 or sample_fraction > 1.0:
+        raise ValueError("--calibration-window-sample-fraction must be in the range (0, 1].")
     model_path, calibrator_path, metrics, oof_predictions = train_and_calibrate(
         features_df=train_features,
         cutoff_minutes=args.cutoff_minutes,
         store=store,
         split_date=args.split_date,
+        calibration_randomize_within_windows=args.calibration_randomize_within_windows,
+        calibration_window_sample_fraction=sample_fraction,
+        calibration_random_state=args.calibration_random_state,
     )
     log(f"Model saved to {model_path}, calibrator to {calibrator_path}, metrics={metrics}")
     if args.show_preds:
@@ -180,6 +232,7 @@ def main() -> None:
                 min_bets=args.strategy_min_bets,
                 stake=1.0,
                 log_every=args.strategy_log_every,
+                min_prob=args.strategy_min_prob,
             )
             if results.empty:
                 log("Strategy tuning: no configs met constraints.")

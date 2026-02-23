@@ -30,6 +30,9 @@ DEFAULT_CV_FOLDS = 5
 DEFAULT_CV_GAP_DAYS = 1
 DEFAULT_CV_STRATEGY = "expanding"
 DEFAULT_MARKET_TYPE_MIN_ROWS = 5000
+DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS = True
+DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION = 0.8
+DEFAULT_CALIBRATION_RANDOM_STATE = 42
 
 
 class ProbabilityCalibrator:
@@ -344,6 +347,9 @@ def _train_single_model(
     cv_strategy: str,
     label: str,
     feature_columns: Optional[list[str]] = None,
+    calibration_randomize_within_windows: bool = DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    calibration_window_sample_fraction: float = DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+    calibration_random_state: int = DEFAULT_CALIBRATION_RANDOM_STATE,
 ) -> tuple[Optional[object], Optional[object], Dict[str, float], Optional[pd.Series]]:
     """Train one LightGBM model + calibrator for a specific data subset."""
     if df.empty:
@@ -389,12 +395,23 @@ def _train_single_model(
         oof_raw = _compute_oof_raw_predictions(X, y, time_folds, best_params)
         oof_mask = oof_raw.notna()
         if oof_mask.any():
-            eval_y = y[oof_mask]
+            oof_index = oof_raw[oof_mask].index
+            eval_y = y.loc[oof_index]
+            calibration_windows = []
+            for _, valid_idx in time_folds:
+                window = pd.Index(valid_idx).intersection(oof_index)
+                if not window.empty:
+                    calibration_windows.append(window)
             calibrator, calibrated = _cross_fit_probability_calibrator(
                 oof_raw[oof_mask].to_numpy(),
                 eval_y,
+                sample_index=oof_index,
+                time_windows=calibration_windows,
+                randomize_within_windows=calibration_randomize_within_windows,
+                window_sample_fraction=calibration_window_sample_fraction,
+                random_state=calibration_random_state,
             )
-            oof_predictions = pd.Series(calibrated, index=oof_raw[oof_mask].index)
+            oof_predictions = pd.Series(calibrated, index=oof_index)
             probs = calibrated
         else:
             log(f"Training{label}: OOF predictions empty; using in-sample probabilities.")
@@ -408,7 +425,14 @@ def _train_single_model(
             X, y, groups=groups, test_size=0.2, random_state=42, label=f"Training{label}"
         )
         raw_calib = base_model.predict_proba(X_calib)[:, 1]
-        calibrator, calibrated = _cross_fit_probability_calibrator(raw_calib, y_calib)
+        calibrator, calibrated = _cross_fit_probability_calibrator(
+            raw_calib,
+            y_calib,
+            sample_index=X_calib.index,
+            randomize_within_windows=calibration_randomize_within_windows,
+            window_sample_fraction=calibration_window_sample_fraction,
+            random_state=calibration_random_state,
+        )
         oof_predictions = pd.Series(calibrated, index=X_calib.index)
         eval_y = y_calib
         probs = calibrated
@@ -439,6 +463,9 @@ def _train_single_model(
         "cv_folds": int(len(time_folds)) if time_folds else 0,
         "cv_gap_days": int(cv_gap_days),
         "cv_strategy": cv_strategy,
+        "calibration_randomize_within_windows": bool(calibration_randomize_within_windows),
+        "calibration_window_sample_fraction": float(calibration_window_sample_fraction),
+        "calibration_random_state": int(calibration_random_state),
         "kappa_threshold": float(kappa_threshold) if kappa_threshold is not None else None,
         "kappa_score": float(kappa_score) if kappa_score is not None else None,
     }
@@ -452,6 +479,9 @@ def _train_market_type_models(
     cv_gap_days: int,
     cv_strategy: str,
     min_rows: int,
+    calibration_randomize_within_windows: bool = DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    calibration_window_sample_fraction: float = DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+    calibration_random_state: int = DEFAULT_CALIBRATION_RANDOM_STATE,
 ) -> tuple[dict, dict, Dict[str, float], pd.Series]:
     """Train per-market-type models with a global fallback and return combined metrics."""
     df = df.copy()
@@ -479,6 +509,9 @@ def _train_market_type_models(
             cv_strategy=cv_strategy,
             label=label,
             feature_columns=feature_columns,
+            calibration_randomize_within_windows=calibration_randomize_within_windows,
+            calibration_window_sample_fraction=calibration_window_sample_fraction,
+            calibration_random_state=calibration_random_state,
         )
         if model is None:
             continue
@@ -502,6 +535,9 @@ def _train_market_type_models(
             cv_strategy=cv_strategy,
             label="[ALL]",
             feature_columns=feature_columns,
+            calibration_randomize_within_windows=calibration_randomize_within_windows,
+            calibration_window_sample_fraction=calibration_window_sample_fraction,
+            calibration_random_state=calibration_random_state,
         )
         if fallback_oof is not None:
             oof_predictions = oof_predictions.fillna(fallback_oof)
@@ -593,27 +629,116 @@ def _fit_probability_calibrator(
         return ProbabilityCalibrator("platt", platt), calibrated
 
 
+def _sample_indices_within_windows(
+    window_positions: list[np.ndarray],
+    sample_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Subsample each time window independently so calibration remains time-safe while reducing overfit pressure."""
+    sampled: list[np.ndarray] = []
+    bounded_fraction = min(1.0, max(0.0, float(sample_fraction)))
+    for window_pos in window_positions:
+        if window_pos.size == 0:
+            continue
+        if bounded_fraction >= 1.0:
+            sampled.append(window_pos)
+            continue
+        keep = int(np.floor(window_pos.size * bounded_fraction))
+        if keep <= 0:
+            keep = 1
+        if keep >= window_pos.size:
+            sampled.append(window_pos)
+            continue
+        chosen = np.sort(rng.choice(window_pos, size=keep, replace=False))
+        sampled.append(chosen)
+    if not sampled:
+        return np.array([], dtype=int)
+    return np.concatenate(sampled)
+
+
+def _build_time_calibration_windows(
+    sample_index: pd.Index,
+    time_windows: list[pd.Index] | None,
+) -> list[np.ndarray]:
+    """Map dataframe-index time windows to positional arrays aligned with calibrator input vectors."""
+    if not time_windows:
+        return []
+    position_map = {idx: pos for pos, idx in enumerate(sample_index)}
+    ordered: list[np.ndarray] = []
+    for window in time_windows:
+        positions = sorted({position_map[idx] for idx in window if idx in position_map})
+        if positions:
+            ordered.append(np.asarray(positions, dtype=int))
+    return ordered
+
+
 def _cross_fit_probability_calibrator(
     raw_probs: np.ndarray,
     y: pd.Series,
     folds: int = 5,
+    sample_index: pd.Index | None = None,
+    time_windows: list[pd.Index] | None = None,
+    randomize_within_windows: bool = False,
+    window_sample_fraction: float = 1.0,
+    random_state: int = 42,
 ) -> tuple[ProbabilityCalibrator, np.ndarray]:
     """Cross-fit calibration predictions so OOF calibration metrics are not self-fitted."""
     raw = np.asarray(raw_probs, dtype=float).reshape(-1)
-    target = pd.Series(y).astype(int).reset_index(drop=True)
+    target = pd.Series(y).astype(int)
     if raw.size == 0 or target.empty:
         raise ValueError("Calibration requires non-empty probabilities and targets.")
+    if len(target) != raw.size:
+        raise ValueError("Calibration inputs must have matching lengths.")
+    if sample_index is None:
+        sample_index = pd.Index(target.index)
+    else:
+        sample_index = pd.Index(sample_index)
+    if len(sample_index) != raw.size:
+        raise ValueError("Calibration sample_index length must match probabilities.")
+    target = pd.Series(target.to_numpy(), index=sample_index)
     if target.nunique() < 2:
         return _fit_probability_calibrator(raw, target)
+
+    ordered_windows = _build_time_calibration_windows(sample_index, time_windows)
+    if len(ordered_windows) >= 2:
+        cross_fitted = np.full(raw.shape, np.nan, dtype=float)
+        rng = np.random.default_rng(int(random_state))
+        for fold_idx in range(1, len(ordered_windows)):
+            valid_pos = ordered_windows[fold_idx]
+            if valid_pos.size == 0:
+                continue
+            train_windows = ordered_windows[:fold_idx]
+            if randomize_within_windows:
+                train_pos = _sample_indices_within_windows(
+                    train_windows,
+                    sample_fraction=window_sample_fraction,
+                    rng=rng,
+                )
+            else:
+                train_pos = np.concatenate(train_windows) if train_windows else np.array([], dtype=int)
+            if train_pos.size == 0:
+                continue
+            y_train = target.iloc[train_pos]
+            y_valid = target.iloc[valid_pos]
+            if y_train.nunique() < 2 or y_valid.nunique() < 2:
+                continue
+            fold_calibrator, _ = _fit_probability_calibrator(raw[train_pos], y_train)
+            cross_fitted[valid_pos] = fold_calibrator.calibrate(raw[valid_pos])
+
+        final_calibrator, _ = _fit_probability_calibrator(raw, target)
+        missing_mask = np.isnan(cross_fitted)
+        if missing_mask.any():
+            cross_fitted[missing_mask] = final_calibrator.calibrate(raw[missing_mask])
+        return final_calibrator, cross_fitted
 
     class_counts = target.value_counts()
     n_splits = min(int(folds), int(class_counts.min()))
     if n_splits < 2:
         return _fit_probability_calibrator(raw, target)
 
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=int(random_state))
     cross_fitted = np.full(raw.shape, np.nan, dtype=float)
-    for train_idx, valid_idx in splitter.split(raw.reshape(-1, 1), target.to_numpy()):
+    for train_idx, valid_idx in splitter.split(raw.reshape(-1, 1), target.to_numpy(dtype=int)):
         fold_calibrator, _ = _fit_probability_calibrator(raw[train_idx], target.iloc[train_idx])
         cross_fitted[valid_idx] = fold_calibrator.calibrate(raw[valid_idx])
 
@@ -633,6 +758,9 @@ def train_and_calibrate(
     cv_folds: int = DEFAULT_CV_FOLDS,
     cv_gap_days: int = DEFAULT_CV_GAP_DAYS,
     cv_strategy: str = DEFAULT_CV_STRATEGY,
+    calibration_randomize_within_windows: bool = DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS,
+    calibration_window_sample_fraction: float = DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION,
+    calibration_random_state: int = DEFAULT_CALIBRATION_RANDOM_STATE,
     run_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Dict[str, float], Optional[pd.Series]]:
     """Train a tuned LightGBM model with rolling CV and return out-of-fold calibrated predictions."""
@@ -653,6 +781,9 @@ def train_and_calibrate(
             cv_gap_days=cv_gap_days,
             cv_strategy=cv_strategy,
             min_rows=DEFAULT_MARKET_TYPE_MIN_ROWS,
+            calibration_randomize_within_windows=calibration_randomize_within_windows,
+            calibration_window_sample_fraction=calibration_window_sample_fraction,
+            calibration_random_state=calibration_random_state,
         )
         metrics.setdefault("tuning_score", None)
         metrics.setdefault("best_params", None)
@@ -666,6 +797,9 @@ def train_and_calibrate(
             cv_strategy=cv_strategy,
             label="",
             feature_columns=feature_columns,
+            calibration_randomize_within_windows=calibration_randomize_within_windows,
+            calibration_window_sample_fraction=calibration_window_sample_fraction,
+            calibration_random_state=calibration_random_state,
         )
 
     metrics["feature_columns"] = feature_columns
@@ -682,6 +816,9 @@ def train_and_calibrate(
     metrics["cv_folds"] = int(metrics.get("cv_folds") or cv_folds)
     metrics["cv_gap_days"] = int(cv_gap_days)
     metrics["cv_strategy"] = cv_strategy
+    metrics["calibration_randomize_within_windows"] = bool(calibration_randomize_within_windows)
+    metrics["calibration_window_sample_fraction"] = float(calibration_window_sample_fraction)
+    metrics["calibration_random_state"] = int(calibration_random_state)
 
     artifacts_path = Path(os.getenv("ARTIFACTS_DIR", artifacts_dir))
     artifacts_path.mkdir(parents=True, exist_ok=True)

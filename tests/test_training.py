@@ -24,6 +24,46 @@ def test_cross_fit_probability_calibrator_returns_finite_predictions():
     assert np.isfinite(calibrator.calibrate(raw[:10])).all()
 
 
+def test_cross_fit_probability_calibrator_time_windows_random_sampling_is_seeded():
+    rng = np.random.default_rng(123)
+    raw = rng.uniform(0.01, 0.99, 400)
+    y = pd.Series((rng.random(400) < raw).astype(int), dtype=int)
+    sample_index = pd.Index(np.arange(len(raw)))
+    windows = [sample_index[i : i + 80] for i in range(0, len(raw), 80)]
+
+    _, calibrated_a = _cross_fit_probability_calibrator(
+        raw,
+        y,
+        sample_index=sample_index,
+        time_windows=windows,
+        randomize_within_windows=True,
+        window_sample_fraction=0.5,
+        random_state=7,
+    )
+    _, calibrated_b = _cross_fit_probability_calibrator(
+        raw,
+        y,
+        sample_index=sample_index,
+        time_windows=windows,
+        randomize_within_windows=True,
+        window_sample_fraction=0.5,
+        random_state=7,
+    )
+    _, calibrated_c = _cross_fit_probability_calibrator(
+        raw,
+        y,
+        sample_index=sample_index,
+        time_windows=windows,
+        randomize_within_windows=True,
+        window_sample_fraction=0.5,
+        random_state=11,
+    )
+
+    assert np.all(np.isfinite(calibrated_a))
+    assert np.allclose(calibrated_a, calibrated_b)
+    assert not np.allclose(calibrated_a, calibrated_c)
+
+
 def test_predict_probabilities_leaves_unknown_bucket_unscored_without_fallback():
     feature_df = pd.DataFrame(
         [

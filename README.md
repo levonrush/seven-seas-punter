@@ -53,6 +53,7 @@ punter go
 - skips historic download when snapshots are fresh enough;
 - auto-refreshes when snapshots are stale (default: older than 30 days);
 - force refresh anytime with `punter go --refresh-historic`.
+- leaves strategy filters/tuning off by default (enable explicitly with command flags when desired).
 
 Use `punter <command> --help` to tune any step (`download-historic`, `pipeline`, `live`, etc.).
 

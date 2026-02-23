@@ -123,6 +123,23 @@ Report latest run:
 punter report
 ```
 
+## Default Filter Behavior
+By default, `train`, `backtest`, `score`, `pipeline`, and `go` do not apply EV/edge/price/spread/min-prob strategy filters automatically.
+
+Enable filters explicitly when needed:
+```bash
+punter backtest --min-ev 0.02 --min-edge 0.1 --max-price 20 --max-spread 0.5
+punter score --min-prob 0.2 --min-ev 0.01
+punter train --tune-strategy
+```
+
+Opt into tuned probability cutoffs explicitly:
+```bash
+punter backtest --use-kappa-thresholds
+punter backtest --use-market-type-kappa-thresholds
+punter score --use-kappa-thresholds
+```
+
 ## Helpful Help
 ```bash
 punter --help

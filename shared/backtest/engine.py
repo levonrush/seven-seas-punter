@@ -7,10 +7,6 @@ import pandas as pd
 from shared.utils.progress import log
 from shared.utils.bet_explain import annotate_preview_frame
 
-DEFAULT_MIN_EDGE = 0.1
-DEFAULT_MAX_PRICE = 200.0
-DEFAULT_MAX_EDGE_MULTIPLIER = 5.0
-
 
 def compute_expected_value(prob: float, price: float, commission: float = 0.05) -> float:
     """Return unit-stake expected value given win probability, price, and commission."""
@@ -34,18 +30,18 @@ def run_backtest(
     probs: pd.Series,
     cutoff_minutes: int,
     commission: float = 0.05,
-    min_ev: float = 0.02,
-    min_edge: float = DEFAULT_MIN_EDGE,
-    max_spread: float = 1.0,
-    max_price: float = DEFAULT_MAX_PRICE,
-    max_edge_multiplier: float = DEFAULT_MAX_EDGE_MULTIPLIER,
+    min_ev: float | None = None,
+    min_edge: float | None = None,
+    max_spread: float | None = None,
+    max_price: float | None = None,
+    max_edge_multiplier: float | None = None,
     min_prob: float | None = None,
     stake: float = 1.0,
     max_bets_per_day: int | None = None,
     max_exposure_per_race: float | None = None,
     quiet: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
-    """Simulate a simple value strategy with deterministic filters and risk controls."""
+    """Simulate a simple value strategy with optional filters and risk controls."""
     if feature_df.empty or probs.empty:
         if not quiet:
             log("Backtest: empty features or probabilities; skipping.")
@@ -77,7 +73,7 @@ def run_backtest(
         if max_price is not None and price > max_price:
             continue
         ev = compute_expected_value(prob, price, commission)
-        if ev < min_ev:
+        if min_ev is not None and ev < min_ev:
             continue
         if min_prob is not None and prob < min_prob:
             continue
@@ -85,13 +81,13 @@ def run_backtest(
         if implied_prob:
             edge_pct = (prob - implied_prob) / implied_prob
             edge_multiplier = prob / implied_prob
-            if edge_pct < min_edge:
+            if min_edge is not None and edge_pct < min_edge:
                 continue
             if max_edge_multiplier is not None and edge_multiplier > max_edge_multiplier:
                 continue
         else:
             continue
-        if spread is not None and spread > max_spread:
+        if max_spread is not None and spread is not None and spread > max_spread:
             continue
         race_date = pd.to_datetime(row["race_start_time"]).date()
         bets.append(
