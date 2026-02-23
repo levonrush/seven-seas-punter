@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
 
@@ -97,12 +99,35 @@ def split_features_by_race_time(
     return feature_df[train_mask].copy(), feature_df[~train_mask].copy()
 
 
-def build_features_from_store(store, cutoff_minutes: int) -> pd.DataFrame:
+def _filter_snapshots_to_markets(snapshots: pd.DataFrame, market_ids: set[str] | None) -> pd.DataFrame:
+    """Limit snapshots to selected market ids so live scoring does not rebuild full-history features."""
+    if snapshots.empty or not market_ids:
+        return snapshots
+    if "market_id" not in snapshots.columns:
+        return snapshots.iloc[0:0].copy()
+    return snapshots[snapshots["market_id"].astype(str).isin(market_ids)].copy()
+
+
+def build_features_from_store(
+    store,
+    cutoff_minutes: int,
+    market_ids: Iterable[str] | None = None,
+) -> pd.DataFrame:
     """Construct leakage-safe features using only snapshots strictly before the cutoff."""
+    market_id_filter = {str(value) for value in (market_ids or []) if str(value).strip()}
     if hasattr(store, "load_snapshots_for_cutoff"):
-        snapshots = store.load_snapshots_for_cutoff(cutoff_minutes)
+        try:
+            snapshots = store.load_snapshots_for_cutoff(
+                cutoff_minutes,
+                market_ids=market_id_filter or None,
+            )
+        except TypeError:
+            # Backwards-compatible fallback for older store shims used in tests.
+            snapshots = store.load_snapshots_for_cutoff(cutoff_minutes)
+            snapshots = _filter_snapshots_to_markets(snapshots, market_id_filter)
     else:
         snapshots = store.load_snapshots()
+        snapshots = _filter_snapshots_to_markets(snapshots, market_id_filter)
     if snapshots.empty:
         log("Features: no snapshots found; returning empty frame.")
         return pd.DataFrame()
@@ -111,6 +136,7 @@ def build_features_from_store(store, cutoff_minutes: int) -> pd.DataFrame:
         snapshots = snapshots.dropna(subset=["snapshot_time", "race_start_time"])
         snapshots = snapshots[snapshots["snapshot_time"] < snapshots["race_start_time"]]
         snapshots = snapshots[snapshots["seconds_to_start"] >= cutoff_minutes * 60].copy()
+        snapshots = _filter_snapshots_to_markets(snapshots, market_id_filter)
     if snapshots.empty:
         log(f"Features: no snapshots at/after cutoff T-{cutoff_minutes}; returning empty frame.")
         return pd.DataFrame()

@@ -207,6 +207,9 @@ class DuckDBStore:
                 df[col] = None
         df = df[cols]
         with self._connect() as con:
+            if run_id:
+                # Keep run-level reports deterministic when the same run_id is backtested repeatedly.
+                con.execute("DELETE FROM bets WHERE run_id = ?", [run_id])
             con.register("df", df)
             con.execute(
                 """
@@ -381,12 +384,24 @@ class DuckDBStore:
         with self._connect() as con:
             return con.execute("SELECT * FROM snapshots").df()
 
-    def load_snapshots_for_cutoff(self, cutoff_minutes: int) -> pd.DataFrame:
+    def load_snapshots_for_cutoff(
+        self,
+        cutoff_minutes: int,
+        market_ids: Optional[Iterable[str]] = None,
+    ) -> pd.DataFrame:
         """Return cutoff-filtered snapshots for feature building to reduce Python-side scan volume."""
         cutoff_seconds = max(0, int(cutoff_minutes) * 60)
+        market_id_values = list(market_ids or [])
+        market_id_values = [str(value) for value in market_id_values if str(value).strip()]
+        market_filter_sql = ""
+        params: list[Any] = [cutoff_seconds]
+        if market_id_values:
+            placeholders = ", ".join(["?"] * len(market_id_values))
+            market_filter_sql = f" AND s.market_id IN ({placeholders})"
+            params.extend(market_id_values)
         with self._connect() as con:
             return con.execute(
-                """
+                f"""
                 SELECT
                     s.market_id,
                     s.selection_id,
@@ -410,8 +425,9 @@ class DuckDBStore:
                   AND s.race_start_time IS NOT NULL
                   AND s.snapshot_time < s.race_start_time
                   AND s.seconds_to_start >= ?
+                  {market_filter_sql}
                 """,
-                [cutoff_seconds],
+                params,
             ).df()
 
     def load_results(self) -> pd.DataFrame:

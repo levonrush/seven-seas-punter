@@ -10,7 +10,7 @@ import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, cohen_kappa_score, log_loss
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import GroupShuffleSplit, StratifiedKFold, train_test_split
 
 from shared.utils.progress import log
 from shared.model.market_type import bucket_market_type
@@ -389,11 +389,12 @@ def _train_single_model(
         oof_raw = _compute_oof_raw_predictions(X, y, time_folds, best_params)
         oof_mask = oof_raw.notna()
         if oof_mask.any():
-            calibrator, calibrated = _fit_probability_calibrator(
-                oof_raw[oof_mask].to_numpy(), y[oof_mask]
+            eval_y = y[oof_mask]
+            calibrator, calibrated = _cross_fit_probability_calibrator(
+                oof_raw[oof_mask].to_numpy(),
+                eval_y,
             )
             oof_predictions = pd.Series(calibrated, index=oof_raw[oof_mask].index)
-            eval_y = y[oof_mask]
             probs = calibrated
         else:
             log(f"Training{label}: OOF predictions empty; using in-sample probabilities.")
@@ -407,7 +408,7 @@ def _train_single_model(
             X, y, groups=groups, test_size=0.2, random_state=42, label=f"Training{label}"
         )
         raw_calib = base_model.predict_proba(X_calib)[:, 1]
-        calibrator, calibrated = _fit_probability_calibrator(raw_calib, y_calib)
+        calibrator, calibrated = _cross_fit_probability_calibrator(raw_calib, y_calib)
         oof_predictions = pd.Series(calibrated, index=X_calib.index)
         eval_y = y_calib
         probs = calibrated
@@ -592,6 +593,37 @@ def _fit_probability_calibrator(
         return ProbabilityCalibrator("platt", platt), calibrated
 
 
+def _cross_fit_probability_calibrator(
+    raw_probs: np.ndarray,
+    y: pd.Series,
+    folds: int = 5,
+) -> tuple[ProbabilityCalibrator, np.ndarray]:
+    """Cross-fit calibration predictions so OOF calibration metrics are not self-fitted."""
+    raw = np.asarray(raw_probs, dtype=float).reshape(-1)
+    target = pd.Series(y).astype(int).reset_index(drop=True)
+    if raw.size == 0 or target.empty:
+        raise ValueError("Calibration requires non-empty probabilities and targets.")
+    if target.nunique() < 2:
+        return _fit_probability_calibrator(raw, target)
+
+    class_counts = target.value_counts()
+    n_splits = min(int(folds), int(class_counts.min()))
+    if n_splits < 2:
+        return _fit_probability_calibrator(raw, target)
+
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    cross_fitted = np.full(raw.shape, np.nan, dtype=float)
+    for train_idx, valid_idx in splitter.split(raw.reshape(-1, 1), target.to_numpy()):
+        fold_calibrator, _ = _fit_probability_calibrator(raw[train_idx], target.iloc[train_idx])
+        cross_fitted[valid_idx] = fold_calibrator.calibrate(raw[valid_idx])
+
+    final_calibrator, _ = _fit_probability_calibrator(raw, target)
+    missing_mask = np.isnan(cross_fitted)
+    if missing_mask.any():
+        cross_fitted[missing_mask] = final_calibrator.calibrate(raw[missing_mask])
+    return final_calibrator, cross_fitted
+
+
 def train_and_calibrate(
     features_df: pd.DataFrame,
     cutoff_minutes: int,
@@ -723,11 +755,12 @@ def _predict_probabilities_by_market_type(
         return pd.Series(dtype=float)
     bucket_series = _bucket_market_series(feature_df)
     model_map = model_bundle.get("models", {})
-    fallback_model = model_bundle.get("fallback") or next(iter(model_map.values()), None)
+    fallback_model = model_bundle.get("fallback")
     feature_columns = model_bundle.get("feature_columns")
-    if feature_columns is None and hasattr(fallback_model, "feature_name_"):
-        feature_columns = list(getattr(fallback_model, "feature_name_", []))
-    if fallback_model is None:
+    feature_template_model = fallback_model or next(iter(model_map.values()), None)
+    if feature_columns is None and hasattr(feature_template_model, "feature_name_"):
+        feature_columns = list(getattr(feature_template_model, "feature_name_", []))
+    if feature_template_model is None:
         return pd.Series(dtype=float)
 
     calibrator_map = {}
@@ -742,8 +775,17 @@ def _predict_probabilities_by_market_type(
     if feature_columns:
         _log_feature_alignment(feature_df, feature_columns, "Predict")
     for bucket, indices in bucket_series.groupby(bucket_series).groups.items():
-        model = model_map.get(bucket, fallback_model)
-        calibrator = calibrator_map.get(bucket, fallback_calibrator)
+        model = model_map.get(bucket)
+        calibrator = calibrator_map.get(bucket)
+        if model is None:
+            if fallback_model is None:
+                log(
+                    f"Predict: no model available for bucket '{bucket}' and no fallback model; "
+                    f"leaving {len(indices)} rows unscored."
+                )
+                continue
+            model = fallback_model
+            calibrator = fallback_calibrator
         if feature_columns:
             X = _align_feature_frame(feature_df.loc[indices], feature_columns)
         else:

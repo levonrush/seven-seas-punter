@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 
 from shared.utils.progress import log
@@ -69,6 +71,8 @@ def run_backtest(
         spread = row.get(spread_col)
         prob = row["p_hat"]
         if price is None or prob is None:
+            continue
+        if not isinstance(prob, (int, float)) or not math.isfinite(float(prob)):
             continue
         if max_price is not None and price > max_price:
             continue

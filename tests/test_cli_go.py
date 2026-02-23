@@ -72,3 +72,16 @@ def test_cmd_repair_manifests_handles_missing_files(monkeypatch):
             backup=True,
         )
     )
+
+
+def test_parser_backtest_defaults_to_win_market_type():
+    parser = build_parser()
+    args = parser.parse_args(["backtest"])
+    assert args.market_types == "WIN"
+
+
+def test_parser_pipeline_has_decision_market_type_default():
+    parser = build_parser()
+    args = parser.parse_args(["pipeline"])
+    assert args.market_types == "ALL"
+    assert args.decision_market_types == "WIN"

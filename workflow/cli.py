@@ -11,6 +11,7 @@ from shared.backtest.engine import build_bet_preview, run_backtest
 from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.features.builder import build_features_from_store, split_features_by_race_time
+from shared.model.market_type import bucket_market_type
 from shared.model.predictions import build_prediction_preview
 from shared.model.tab_translation import estimate_tab_odds_quantiles, quantile_to_column
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
@@ -227,10 +228,8 @@ def _ensure_backtest_run_id(args: argparse.Namespace, store: DuckDBStore) -> Non
         log(f"Backtest: using run id from latest model run ({args.run_id}).")
 
 
-def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | None:
-    """Load the tuned kappa threshold from model runs unless overridden."""
-    if getattr(args, "min_prob", None) is not None:
-        return args.min_prob
+def _load_model_metrics(args: argparse.Namespace, store: DuckDBStore) -> dict | None:
+    """Load metrics JSON for the target run/cutoff so threshold routing can stay centralized."""
     cutoff = getattr(args, "cutoff_minutes", None)
     run_id = getattr(args, "run_id", None)
     with store._connect() as con:  # type: ignore[attr-defined]
@@ -264,9 +263,85 @@ def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | N
             metrics = json.loads(metrics)
         except json.JSONDecodeError:
             return None
-    if isinstance(metrics, dict):
-        return metrics.get("kappa_threshold")
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _resolve_min_prob(args: argparse.Namespace, store: DuckDBStore) -> float | None:
+    """Load the tuned global kappa threshold from model runs unless overridden."""
+    if getattr(args, "min_prob", None) is not None:
+        return float(args.min_prob)
+    metrics = _load_model_metrics(args, store)
+    if not metrics:
+        return None
+    value = metrics.get("kappa_threshold")
+    if isinstance(value, (int, float)):
+        return float(value)
     return None
+
+
+def _resolve_market_type_min_probs(args: argparse.Namespace, store: DuckDBStore) -> dict[str, float]:
+    """Load per-market-type min-prob thresholds from model metrics when available."""
+    if getattr(args, "min_prob", None) is not None:
+        return {}
+    metrics = _load_model_metrics(args, store)
+    if not metrics:
+        return {}
+    bucket_metrics = metrics.get("market_type_models")
+    if not isinstance(bucket_metrics, dict):
+        return {}
+    thresholds: dict[str, float] = {}
+    for bucket, payload in bucket_metrics.items():
+        if not isinstance(payload, dict):
+            continue
+        threshold = payload.get("kappa_threshold")
+        if isinstance(threshold, (int, float)):
+            thresholds[str(bucket).upper()] = float(threshold)
+    return thresholds
+
+
+def _apply_probability_thresholds(
+    frame: pd.DataFrame,
+    label: str,
+    global_min_prob: float | None,
+    bucket_min_probs: dict[str, float],
+) -> pd.DataFrame:
+    """Apply either one global min-prob or per-bucket thresholds to prediction frames."""
+    if frame.empty:
+        return frame
+    if "p_hat" not in frame.columns:
+        return frame
+
+    before = len(frame)
+    filtered = frame[frame["p_hat"].notna()].copy()
+    dropped_nan = before - len(filtered)
+    if dropped_nan:
+        log(f"{label}: dropped {dropped_nan} rows with missing predictions.")
+    if filtered.empty:
+        return filtered
+
+    if global_min_prob is not None and not bucket_min_probs:
+        kept = filtered[filtered["p_hat"] >= global_min_prob].copy()
+        log(f"{label}: applied min_prob={global_min_prob:.3f} ({len(kept)}/{len(filtered)} rows).")
+        return kept
+
+    if bucket_min_probs:
+        if "market_type" in filtered.columns:
+            bucket_series = filtered["market_type"].apply(bucket_market_type).str.upper()
+            threshold_series = bucket_series.map(bucket_min_probs)
+        else:
+            threshold_series = pd.Series(index=filtered.index, dtype=float)
+        if global_min_prob is not None:
+            threshold_series = threshold_series.fillna(global_min_prob)
+        match_count = int(threshold_series.notna().sum())
+        keep_mask = threshold_series.isna() | (filtered["p_hat"] >= threshold_series)
+        kept = filtered.loc[keep_mask].copy()
+        log(
+            f"{label}: applied market-type min_prob thresholds "
+            f"({len(kept)}/{len(filtered)} rows; matched={match_count})."
+        )
+        return kept
+
+    return filtered
 
 def _apply_split_from_days(args: argparse.Namespace, store: DuckDBStore) -> None:
     """Set split_date to the last N days of data when requested."""
@@ -338,6 +413,37 @@ def _select_score_price(feature_row: pd.Series, cutoff_minutes: int) -> float | 
         if pd.notnull(fallback):
             return float(fallback)
     return None
+
+
+def _apply_score_strategy_filters(
+    frame: pd.DataFrame,
+    cutoff_minutes: int,
+    min_ev: float,
+    min_edge: float,
+    max_price: float | None,
+    max_edge_multiplier: float | None,
+    max_spread: float | None,
+) -> pd.DataFrame:
+    """Apply backtest-style EV/edge/price/spread filters so score output matches strategy assumptions."""
+    if frame.empty:
+        return frame
+    filtered = frame.copy()
+    filtered["implied_prob"] = 1.0 / filtered["decision_price"]
+    filtered["edge_pct"] = (filtered["p_hat"] - filtered["implied_prob"]) / filtered["implied_prob"]
+    filtered["edge_multiplier"] = filtered["p_hat"] / filtered["implied_prob"]
+
+    before = len(filtered)
+    filtered = filtered[filtered["ev"] >= min_ev]
+    filtered = filtered[filtered["edge_pct"] >= min_edge]
+    if max_price is not None:
+        filtered = filtered[filtered["decision_price"] <= max_price]
+    if max_edge_multiplier is not None:
+        filtered = filtered[filtered["edge_multiplier"] <= max_edge_multiplier]
+    spread_col = f"spread_t{cutoff_minutes}"
+    if max_spread is not None and spread_col in filtered.columns:
+        filtered = filtered[filtered[spread_col].isna() | (filtered[spread_col] <= max_spread)]
+    log(f"Score: strategy filters kept {len(filtered)}/{before} rows.")
+    return filtered
 
 
 def _resolve_execution_domain(args: argparse.Namespace) -> str:
@@ -519,9 +625,16 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     if features.empty:
         log("Backtest: no features available after split; skipping.")
         return
-    min_prob = _resolve_min_prob(args, store)
-    if min_prob is not None:
-        log(f"Backtest: using min_prob={min_prob:.3f} from kappa tuning.")
+    global_min_prob = _resolve_min_prob(args, store)
+    bucket_min_probs = _resolve_market_type_min_probs(args, store)
+    if global_min_prob is not None and not bucket_min_probs:
+        source = "CLI override" if getattr(args, "min_prob", None) is not None else "kappa tuning"
+        log(f"Backtest: using min_prob={global_min_prob:.3f} ({source}).")
+    elif bucket_min_probs:
+        log(
+            "Backtest: using market-type min_prob thresholds "
+            f"for {sorted(bucket_min_probs.keys())}."
+        )
     model_path = getattr(args, "model_path", None) or f"artifacts/model_cutoff_{args.cutoff_minutes}.joblib"
     calibrator_path = getattr(args, "calibrator_path", None) or f"artifacts/calibrator_cutoff_{args.cutoff_minutes}.joblib"
     probs = None
@@ -541,6 +654,19 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             price_col = f"back_price_t{args.cutoff_minutes}"
             implied = 1 / features[price_col]
             probs = implied.fillna(implied.mean())
+    prediction_frame = features.copy()
+    prediction_frame["p_hat"] = probs
+    prediction_frame = _apply_probability_thresholds(
+        prediction_frame,
+        label="Backtest",
+        global_min_prob=global_min_prob,
+        bucket_min_probs=bucket_min_probs,
+    )
+    if prediction_frame.empty:
+        log("Backtest: no rows remain after probability thresholds.")
+        return
+    features = prediction_frame.drop(columns=["p_hat"])
+    probs = prediction_frame["p_hat"]
     bets, metrics = run_backtest(
         feature_df=features,
         probs=probs,
@@ -551,7 +677,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         max_spread=args.max_spread,
         max_price=args.max_price,
         max_edge_multiplier=args.max_edge_mult,
-        min_prob=min_prob,
+        min_prob=None,
         stake=args.stake,
     )
     store.record_bets(bets.to_dict(orient="records"), run_id=getattr(args, "run_id", None))
@@ -607,7 +733,14 @@ def cmd_score(args: argparse.Namespace) -> None:
     snapshots = _capture_latest_snapshots(client, market_ids, cutoff_minutes=args.cutoff_minutes)
     store.append_snapshots(snapshots)
 
-    features = build_features_from_store(store, cutoff_minutes=args.cutoff_minutes)
+    features = build_features_from_store(
+        store,
+        cutoff_minutes=args.cutoff_minutes,
+        market_ids=market_ids,
+    )
+    before_market_scope = len(features)
+    features = features[features["market_id"].astype(str).isin(set(market_ids))].copy()
+    log(f"Score: market-id scope kept {len(features)}/{before_market_scope} rows.")
     features = _filter_to_market_types(features, "Score", market_tokens)
     if features.empty:
         log("No features available for scoring.")
@@ -624,14 +757,17 @@ def cmd_score(args: argparse.Namespace) -> None:
         probs = implied.fillna(implied.mean())
 
     features["p_hat"] = probs
-    min_prob = _resolve_min_prob(args, store)
-    if min_prob is not None:
-        before = len(features)
-        features = features[features["p_hat"] >= min_prob].copy()
-        log(f"Score: applied min_prob={min_prob:.3f} ({len(features)}/{before} rows).")
-        if features.empty:
-            log("No rows remain after min_prob filter.")
-            return
+    global_min_prob = _resolve_min_prob(args, store)
+    bucket_min_probs = _resolve_market_type_min_probs(args, store)
+    features = _apply_probability_thresholds(
+        features,
+        label="Score",
+        global_min_prob=global_min_prob,
+        bucket_min_probs=bucket_min_probs,
+    )
+    if features.empty:
+        log("No rows remain after min_prob filter.")
+        return
     features["betfair_price"] = features.apply(
         lambda row: _select_score_price(row, args.cutoff_minutes),
         axis=1,
@@ -686,6 +822,18 @@ def cmd_score(args: argparse.Namespace) -> None:
         ),
         axis=1,
     )
+    features = _apply_score_strategy_filters(
+        frame=features,
+        cutoff_minutes=args.cutoff_minutes,
+        min_ev=float(getattr(args, "min_ev", 0.02)),
+        min_edge=float(getattr(args, "min_edge", 0.1)),
+        max_price=getattr(args, "max_price", 200.0),
+        max_edge_multiplier=getattr(args, "max_edge_mult", 5.0),
+        max_spread=getattr(args, "max_spread", 1.0),
+    )
+    if features.empty:
+        log("Score: no rows remain after strategy filters.")
+        return
 
     runners = store.load_runners()
     if not runners.empty:
@@ -845,27 +993,55 @@ def cmd_report(args: argparse.Namespace) -> None:
         if run_id:
             bet_row = con.execute(
                 """
+                WITH dedup AS (
+                    SELECT DISTINCT
+                        market_id,
+                        selection_id,
+                        run_id,
+                        bet_time,
+                        stake,
+                        price,
+                        bet_type,
+                        expected_value,
+                        commission_rate,
+                        result_profit
+                    FROM bets
+                    WHERE run_id = ?
+                )
                 SELECT
                     COUNT(*) AS bets,
                     SUM(stake) AS turnover,
                     SUM(result_profit) AS profit,
                     SUM(expected_value * stake) AS expected_profit,
                     SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
-                FROM bets
-                WHERE run_id = ?
+                FROM dedup
                 """,
                 [run_id],
             ).fetchone()
         else:
             bet_row = con.execute(
                 """
+                WITH dedup AS (
+                    SELECT DISTINCT
+                        market_id,
+                        selection_id,
+                        run_id,
+                        bet_time,
+                        stake,
+                        price,
+                        bet_type,
+                        expected_value,
+                        commission_rate,
+                        result_profit
+                    FROM bets
+                )
                 SELECT
                     COUNT(*) AS bets,
                     SUM(stake) AS turnover,
                     SUM(result_profit) AS profit,
                     SUM(expected_value * stake) AS expected_profit,
                     SUM(CASE WHEN result_profit > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS hit_rate
-                FROM bets
+                FROM dedup
                 """
             ).fetchone()
 
@@ -938,6 +1114,14 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     """Run ingest (optional), build features, train, backtest, and score in one go."""
     log("Starting pipeline...")
     _ensure_run_id(args)
+    decision_market_types = (
+        getattr(args, "decision_market_types", None) or getattr(args, "market_types", "ALL")
+    )
+    if str(decision_market_types).strip().upper() == "ALL":
+        log(
+            "Pipeline: decision-market-types=ALL applies one strategy across all market buckets; "
+            "use --decision-market-types WIN (recommended) for cleaner comparability."
+        )
     if getattr(args, "ingest_new", False):
         args.incremental = True
     if args.archive:
@@ -969,29 +1153,50 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
         args.report = report_flag
     if not args.skip_backtest:
         log("Step: backtest")
-        cmd_backtest(args)
+        backtest_args = argparse.Namespace(**vars(args))
+        backtest_args.market_types = decision_market_types
+        cmd_backtest(backtest_args)
     if not args.skip_score:
         log("Step: score")
-        args.output = args.output or f"artifacts/pipeline_score_cutoff_{args.cutoff_minutes}.csv"
-        cmd_score(args)
+        score_args = argparse.Namespace(**vars(args))
+        score_args.market_types = decision_market_types
+        score_args.output = score_args.output or f"artifacts/pipeline_score_cutoff_{args.cutoff_minutes}.csv"
+        cmd_score(score_args)
     if getattr(args, "report", False):
         log("Step: report")
         cmd_report(args)
     log("Pipeline complete.")
 
 
-def cmd_go(_args: argparse.Namespace) -> None:
+def cmd_go(args: argparse.Namespace) -> None:
     """Run the default optimized end-to-end flow with no tuning flags required.
 
     Why: provide a single CLI command for users who want the recommended path without
     memorizing command options. Advanced users can still tune each subcommand directly.
     """
+    run_historic_download = True
+    if not getattr(args, "refresh_historic", False):
+        try:
+            store = DuckDBStore()
+            snapshot_rows = store.table_row_count("snapshots")
+            if snapshot_rows > 0:
+                run_historic_download = False
+                log(
+                    "Go: snapshots already present "
+                    f"({snapshot_rows} rows); skipping historic download. "
+                    "Use --refresh-historic to force it."
+                )
+        except Exception as exc:  # pragma: no cover - defensive fallback around local DB state
+            log(f"Go: could not inspect snapshots ({exc}); proceeding with historic download.")
     parser = build_parser()
 
-    historic_tokens = ["download-historic", *go_historic_args()]
-    log(f"Go: running `punter {' '.join(historic_tokens)}`")
-    historic_args = parser.parse_args(historic_tokens)
-    historic_args.func(historic_args)
+    if run_historic_download:
+        historic_tokens = ["download-historic", *go_historic_args()]
+        log(f"Go: running `punter {' '.join(historic_tokens)}`")
+        historic_args = parser.parse_args(historic_tokens)
+        historic_args.func(historic_args)
+    else:
+        log("Go: skipping `punter download-historic`.")
 
     pipeline_tokens = ["pipeline", *go_pipeline_args()]
     log(f"Go: running `punter {' '.join(pipeline_tokens)}`")
@@ -1285,8 +1490,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--cutoff-minutes", type=int, default=10, choices=[60, 30, 10, 5, 2, 1])
     p_bt.add_argument(
         "--market-types",
-        default="ALL",
-        help="Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). ALL disables filtering.",
+        default="WIN",
+        help=(
+            "Comma-separated market types/buckets (e.g., WIN,PLACE,EXOTIC,EXACTA). "
+            "Defaults to WIN for strategy comparability."
+        ),
     )
     p_bt.add_argument("--commission", type=float, default=0.05)
     p_bt.add_argument("--min-ev", type=float, default=0.02)
@@ -1346,6 +1554,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-prob",
         type=float,
         help="Optional min probability to include in scoring (defaults to tuned kappa threshold).",
+    )
+    p_score.add_argument("--min-ev", type=float, default=0.02, help="Min expected value filter for scored rows.")
+    p_score.add_argument("--min-edge", type=float, default=0.1, help="Min edge filter for scored rows.")
+    p_score.add_argument("--max-spread", type=float, default=1.0, help="Max spread filter for scored rows.")
+    p_score.add_argument("--max-price", type=float, default=200.0, help="Max decision price for scored rows.")
+    p_score.add_argument(
+        "--max-edge-mult",
+        type=float,
+        default=5.0,
+        help="Max implied-probability multiplier for scored rows.",
     )
     p_score.add_argument("--budget", type=float, help="Optional day budget for stake allocation.")
     p_score.add_argument(
@@ -1518,6 +1736,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="ALL",
         help="Comma-separated market types/buckets for train/backtest/score. ALL disables filtering.",
     )
+    p_pipe.add_argument(
+        "--decision-market-types",
+        default="WIN",
+        help=(
+            "Market types for backtest/score decisions inside pipeline. "
+            "Train scope still uses --market-types."
+        ),
+    )
     p_pipe.add_argument("--commission", type=float, default=0.05)
     p_pipe.add_argument("--min-ev", type=float, default=0.02)
     p_pipe.add_argument("--min-edge", type=float, default=0.1)
@@ -1657,6 +1883,11 @@ def build_parser() -> argparse.ArgumentParser:
         "go",
         aliases=["auto"],
         help="Run the default optimized flow (historic download -> incremental pipeline).",
+    )
+    p_go.add_argument(
+        "--refresh-historic",
+        action="store_true",
+        help="Force historic download even when snapshots already exist in DuckDB.",
     )
     p_go.set_defaults(func=cmd_go)
 

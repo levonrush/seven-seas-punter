@@ -5,6 +5,7 @@ import requests
 
 from workflow.download_historic import (
     _extract_basket_size_mb,
+    _load_manifest,
     _is_retryable_download_error,
     _normalize_market_types,
     _plan_sharded_windows,
@@ -80,3 +81,26 @@ def test_resolve_workers_uses_auto_preset_when_missing(monkeypatch):
     workers, auto = _resolve_workers(None)
     assert workers == 6
     assert auto is True
+
+
+def test_load_manifest_recovers_from_empty_file(tmp_path):
+    manifest_path = tmp_path / "historic_manifest.json"
+    manifest_path.write_text("", encoding="utf-8")
+
+    manifest = _load_manifest(manifest_path)
+
+    assert manifest["files"] == {}
+    assert manifest["version"] == 1
+    assert manifest["_basenames"] == set()
+
+
+def test_load_manifest_recovers_from_invalid_json_and_backups(tmp_path):
+    manifest_path = tmp_path / "historic_manifest.json"
+    manifest_path.write_text("{", encoding="utf-8")
+
+    manifest = _load_manifest(manifest_path)
+
+    assert manifest["files"] == {}
+    assert manifest["version"] == 1
+    backup_files = list(tmp_path.glob("historic_manifest.json.bad_*"))
+    assert len(backup_files) == 1

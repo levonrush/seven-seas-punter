@@ -3,6 +3,14 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Hardened historic download manifest loading to recover from empty/corrupt JSON (with timestamped `.bad_*` backups) instead of crashing `punter go`.
+- Restricted `score`/`pub` feature generation to fetched market ids so daily scoring no longer re-scores historical markets.
+- Added backtest-style strategy filters (`min_ev`, `min_edge`, `max_spread`, `max_price`, `max_edge_mult`) to `score` output for train/backtest/score parity.
+- Added per-market-type probability thresholds (with global fallback) for score/backtest filtering when market-type models are present.
+- Switched probability calibration to cross-fitted calibration predictions to reduce calibration self-fit optimism in OOF metrics.
+- Prevented arbitrary market-bucket model routing: unknown buckets without fallback are now left unscored instead of using a random bucket model.
+- Backtest CLI now defaults to `--market-types WIN`; pipeline adds `--decision-market-types` (default `WIN`) for strategy-stage scope.
+- `record_bets` now replaces existing rows for the same `run_id`, and report queries dedupe rows to avoid repeated-backtest double counting.
 - Fixed prediction preview market metadata merging so `market_type` is preserved/backfilled instead of showing false `UNKNOWN` labels.
 - Reduced feature-build runtime by pushing cutoff/time filtering into DuckDB and cutting repeated per-runner snapshot scans in Python.
 - Ignored generated manifest backup files (`data/*manifest.json.bak_*`) and bad-member artifact lists to prevent oversized accidental commits.

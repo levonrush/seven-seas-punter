@@ -261,15 +261,75 @@ def _parse_package_month(value: str) -> dt.date:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).date()
 
 
+def _default_manifest_payload() -> dict:
+    """Provide a stable empty manifest payload so recoverable parse failures do not crash download runs."""
+    return {"files": {}, "version": 1}
+
+
+def _backup_invalid_manifest(path: Path) -> Path | None:
+    """Copy a corrupted manifest to a timestamped sidecar path so operators can inspect bad state later."""
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_path = path.with_name(f"{path.name}.bad_{timestamp}")
+    try:
+        shutil.copy2(path, backup_path)
+    except OSError as exc:
+        log(
+            "Historic download: "
+            f"failed to back up invalid manifest {path} ({exc}); continuing with a fresh manifest."
+        )
+        return None
+    return backup_path
+
+
 def _load_manifest(path: Path) -> dict:
-    """Load or initialize the historic download manifest."""
+    """Load manifest state while tolerating empty/corrupt files so resumed downloads are resilient."""
+    data = _default_manifest_payload()
     if path.exists():
-        data = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        data = {"files": {}, "version": 1}
-    files = data.get("files") or {}
+        raw_payload = path.read_text(encoding="utf-8")
+        if raw_payload.strip():
+            try:
+                loaded = json.loads(raw_payload)
+                if isinstance(loaded, dict):
+                    data = loaded
+                else:
+                    log(
+                        "Historic download: "
+                        f"manifest {path} contains non-object JSON; using a fresh manifest."
+                    )
+            except json.JSONDecodeError as exc:
+                backup_path = _backup_invalid_manifest(path)
+                if backup_path is not None:
+                    log(
+                        "Historic download: "
+                        f"manifest {path} is invalid JSON ({exc}); backed up to {backup_path} and reset."
+                    )
+                else:
+                    log(
+                        "Historic download: "
+                        f"manifest {path} is invalid JSON ({exc}); using a fresh manifest."
+                    )
+        else:
+            log(f"Historic download: manifest {path} is empty; using a fresh manifest.")
+    files = data.get("files")
+    if not isinstance(files, dict):
+        log(
+            "Historic download: "
+            f"manifest {path} has non-object 'files'; using an empty files map."
+        )
+        files = {}
     data["files"] = files
-    data["_basenames"] = {entry.get("basename") for entry in files.values() if entry.get("basename")}
+    try:
+        data["version"] = int(data.get("version", 1) or 1)
+    except (TypeError, ValueError):
+        data["version"] = 1
+    basenames = set()
+    for entry in files.values():
+        if not isinstance(entry, dict):
+            continue
+        basename = entry.get("basename")
+        if basename:
+            basenames.add(str(basename))
+    data["_basenames"] = basenames
     return data
 
 

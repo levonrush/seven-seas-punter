@@ -98,3 +98,46 @@ def test_split_features_by_race_time():
     train_df, test_df = split_features_by_race_time(features, "2024-01-02")
     assert len(train_df) == 1
     assert len(test_df) == 1
+
+
+def test_feature_builder_filters_to_requested_market_ids():
+    snapshots = pd.DataFrame(
+        [
+            {
+                "market_id": "1.1",
+                "selection_id": 1,
+                "snapshot_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+                "seconds_to_start": 600,
+                "best_back_price": 2.0,
+                "best_back_size": 100,
+                "best_lay_price": 2.1,
+                "best_lay_size": 120,
+                "last_traded_price": 2.05,
+                "total_matched": 1000,
+                "runner_status": "ACTIVE",
+                "venue": "A",
+                "race_start_time": pd.Timestamp("2024-01-01T00:10:00Z"),
+                "race_name": "Race A",
+            },
+            {
+                "market_id": "1.2",
+                "selection_id": 2,
+                "snapshot_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+                "seconds_to_start": 600,
+                "best_back_price": 3.0,
+                "best_back_size": 90,
+                "best_lay_price": 3.1,
+                "best_lay_size": 100,
+                "last_traded_price": 3.05,
+                "total_matched": 900,
+                "runner_status": "ACTIVE",
+                "venue": "B",
+                "race_start_time": pd.Timestamp("2024-01-01T00:12:00Z"),
+                "race_name": "Race B",
+            },
+        ]
+    )
+    store = FakeStore(snapshots=snapshots, results=pd.DataFrame())
+    features = build_features_from_store(store, cutoff_minutes=10, market_ids=["1.1"])
+    assert len(features) == 1
+    assert features["market_id"].tolist() == ["1.1"]

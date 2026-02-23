@@ -46,3 +46,31 @@ def test_backtest_metrics():
     assert metrics["bets"] == 2
     assert round(metrics["roi"], 2) > 0
     assert "max_drawdown" in metrics
+
+
+def test_backtest_skips_nan_probabilities():
+    feature_df = pd.DataFrame(
+        [
+            {
+                "market_id": "1.1",
+                "selection_id": 1,
+                "race_start_time": pd.Timestamp("2024-01-01T00:10:00Z"),
+                "back_price_t10": 5.0,
+                "spread_t10": 0.1,
+                "win_target": 0,
+            }
+        ]
+    )
+    probs = pd.Series([float("nan")])
+    bets, metrics = run_backtest(
+        feature_df=feature_df,
+        probs=probs,
+        cutoff_minutes=10,
+        min_ev=-1.0,
+        min_edge=-1.0,
+        max_spread=1.0,
+        max_price=1000.0,
+        max_edge_multiplier=1000.0,
+    )
+    assert bets.empty
+    assert metrics == {}
