@@ -14,6 +14,15 @@ def recommended_historic_workers(cpu_count: int | None = None) -> int:
     return max(2, min(8, int(cores)))
 
 
+def go_historic_stale_days_default() -> int:
+    """Return the default staleness window used by `punter go` to auto-refresh historic data.
+
+    Why: refreshes should happen automatically when stored snapshots are old enough, without forcing
+    expensive historic downloads on every run.
+    """
+    return 30
+
+
 def go_historic_args() -> List[str]:
     """Return CLI args for the no-tune historic download step used by `punter go`.
 
@@ -40,4 +49,3 @@ def go_pipeline_args() -> List[str]:
         "--cutoff-minutes",
         "10",
     ]
-

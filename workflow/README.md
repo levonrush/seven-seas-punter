@@ -11,8 +11,14 @@ One-command optimized run (recommended default):
 punter go
 ```
 This runs:
-- `download-historic --auto --market-types ALL --workers <auto> --clean-temp`
+- `download-historic --auto --market-types ALL --workers <auto> --clean-temp` (only when needed)
 - `pipeline --ingest-new --cutoff-minutes 10`
+
+`go` checks DuckDB freshness first:
+- if snapshots are fresh, it skips `download-historic`;
+- if snapshots are stale (default: older than 30 days), it refreshes historic data automatically;
+- `--refresh-historic` always forces download;
+- `--refresh-historic-if-stale-days N` changes the stale threshold (negative disables stale auto-refresh).
 
 Full pipeline (ingest -> features -> train -> backtest -> score -> report):
 ```bash
@@ -22,6 +28,11 @@ punter pipeline --cutoff-minutes 10
 Historic download (auto, resume from manifest):
 ```bash
 punter download-historic --auto
+```
+Add a new sport (example):
+```bash
+punter download-historic --auto --sport "Greyhound Racing" --market-types ALL --clean-temp
+punter pipeline --ingest-new --cutoff-minutes 10
 ```
 Show available market types before downloading:
 ```bash

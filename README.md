@@ -49,6 +49,11 @@ One-command optimized run:
 ```bash
 punter go
 ```
+`punter go` now checks DuckDB freshness first:
+- skips historic download when snapshots are fresh enough;
+- auto-refreshes when snapshots are stale (default: older than 30 days);
+- force refresh anytime with `punter go --refresh-historic`.
+
 Use `punter <command> --help` to tune any step (`download-historic`, `pipeline`, `live`, etc.).
 
 Real historic data:
@@ -67,6 +72,12 @@ punter download-historic --auto
 punter ingest --incremental
 # or
 punter pipeline --cutoff-minutes 10 --ingest-new
+```
+
+Add a new sport to your local dataset:
+```bash
+punter download-historic --auto --sport "Greyhound Racing" --market-types ALL --clean-temp
+punter pipeline --ingest-new --cutoff-minutes 10
 ```
 
 ## Two practical modes

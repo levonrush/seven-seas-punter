@@ -7,6 +7,22 @@ One command (recommended default):
 ```bash
 punter go
 ```
+Default `go` behavior:
+- checks DuckDB snapshots before downloading;
+- skips `download-historic` when data is fresh;
+- auto-refreshes historic data when the latest snapshot is older than 30 days.
+
+Force or tune refresh behavior:
+```bash
+# always refresh historic first
+punter go --refresh-historic
+
+# refresh only if older than 14 days
+punter go --refresh-historic-if-stale-days 14
+
+# disable stale-data auto-refresh (skip historic when snapshots exist)
+punter go --refresh-historic-if-stale-days -1
+```
 
 Manual pipeline control:
 ```bash
@@ -18,6 +34,31 @@ Incremental update cycle:
 ```bash
 punter download-historic --auto
 punter ingest --incremental
+```
+
+## Add New Sports / Scopes
+Add another sport into the local archive+DB (example: greyhounds):
+```bash
+punter download-historic --auto --sport "Greyhound Racing" --market-types ALL --clean-temp
+punter pipeline --ingest-new --cutoff-minutes 10
+```
+
+Narrow to specific market types while onboarding:
+```bash
+punter download-historic --auto --sport "Horse Racing" --market-types WIN,PLACE
+punter pipeline --ingest-new --cutoff-minutes 10
+```
+
+Inspect available market-type codes before committing:
+```bash
+punter download-historic --auto --sport "Horse Racing" --show-market-types
+```
+
+If ingest/download holes were detected (bad stream members):
+```bash
+punter repair-manifests --bad-list artifacts/ingest_bad_stream_members.txt
+punter download-historic --auto --refresh-list-cache
+punter pipeline --ingest-new --cutoff-minutes 10
 ```
 
 ## Two Operating Modes

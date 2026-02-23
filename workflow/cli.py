@@ -17,7 +17,11 @@ from shared.model.tab_translation import estimate_tab_odds_quantiles, quantile_t
 from shared.model.training import load_model_and_calibrator, predict_probabilities, train_and_calibrate
 from shared.storage.duckdb_store import DuckDBStore
 from shared.utils.bet_explain import preview_legend_lines
-from shared.utils.cli_presets import go_historic_args, go_pipeline_args
+from shared.utils.cli_presets import (
+    go_historic_args,
+    go_historic_stale_days_default,
+    go_pipeline_args,
+)
 from shared.utils.manifest_repair import repair_manifests
 from shared.utils.market_types import (
     api_market_type_codes,
@@ -1168,6 +1172,31 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
     log("Pipeline complete.")
 
 
+def _as_utc_datetime(value: object) -> dt.datetime | None:
+    """Normalize timestamp-like values to timezone-aware UTC datetimes for stale-data checks."""
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value.astimezone(dt.timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = dt.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    return None
+
+
 def cmd_go(args: argparse.Namespace) -> None:
     """Run the default optimized end-to-end flow with no tuning flags required.
 
@@ -1175,17 +1204,42 @@ def cmd_go(args: argparse.Namespace) -> None:
     memorizing command options. Advanced users can still tune each subcommand directly.
     """
     run_historic_download = True
+    stale_days = int(getattr(args, "refresh_historic_if_stale_days", go_historic_stale_days_default()))
     if not getattr(args, "refresh_historic", False):
         try:
             store = DuckDBStore()
             snapshot_rows = store.table_row_count("snapshots")
             if snapshot_rows > 0:
-                run_historic_download = False
-                log(
-                    "Go: snapshots already present "
-                    f"({snapshot_rows} rows); skipping historic download. "
-                    "Use --refresh-historic to force it."
-                )
+                if stale_days < 0:
+                    run_historic_download = False
+                    log(
+                        "Go: snapshots already present "
+                        f"({snapshot_rows} rows); stale-data auto-refresh disabled. "
+                        "Use --refresh-historic to force download."
+                    )
+                else:
+                    latest_snapshot = _as_utc_datetime(store.max_snapshot_time())
+                    if latest_snapshot is None:
+                        log(
+                            "Go: snapshots exist but latest snapshot timestamp is unavailable; "
+                            "running historic download to avoid stale gaps."
+                        )
+                    else:
+                        now_utc = dt.datetime.now(dt.timezone.utc)
+                        age_days = (now_utc - latest_snapshot).total_seconds() / 86400.0
+                        if age_days > float(stale_days):
+                            log(
+                                "Go: latest snapshot age "
+                                f"{age_days:.1f} days exceeds stale threshold ({stale_days} days); "
+                                "running historic download."
+                            )
+                        else:
+                            run_historic_download = False
+                            log(
+                                "Go: snapshots already present "
+                                f"({snapshot_rows} rows, latest {latest_snapshot.date()}); "
+                                f"skipping historic download (stale threshold {stale_days} days)."
+                            )
         except Exception as exc:  # pragma: no cover - defensive fallback around local DB state
             log(f"Go: could not inspect snapshots ({exc}); proceeding with historic download.")
     parser = build_parser()
@@ -1888,6 +1942,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--refresh-historic",
         action="store_true",
         help="Force historic download even when snapshots already exist in DuckDB.",
+    )
+    p_go.add_argument(
+        "--refresh-historic-if-stale-days",
+        type=int,
+        default=go_historic_stale_days_default(),
+        help=(
+            "Auto-refresh historic data when the latest snapshot is older than this many days "
+            "(set negative to disable stale-data auto-refresh)."
+        ),
     )
     p_go.set_defaults(func=cmd_go)
 

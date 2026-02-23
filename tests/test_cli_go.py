@@ -9,7 +9,12 @@ sys.modules.setdefault(
     types.SimpleNamespace(DuckDBPyConnection=object, connect=lambda *args, **kwargs: None),
 )
 
-from shared.utils.cli_presets import go_historic_args, go_pipeline_args, recommended_historic_workers
+from shared.utils.cli_presets import (
+    go_historic_args,
+    go_historic_stale_days_default,
+    go_pipeline_args,
+    recommended_historic_workers,
+)
 from workflow.cli import build_parser, cmd_go, cmd_repair_manifests
 
 
@@ -38,7 +43,7 @@ def test_cmd_go_runs_historic_then_pipeline(monkeypatch):
     monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
     monkeypatch.setattr(
         "workflow.cli.DuckDBStore",
-        lambda: types.SimpleNamespace(table_row_count=lambda _table: 0),
+        lambda: types.SimpleNamespace(table_row_count=lambda _table: 0, max_snapshot_time=lambda: None),
     )
 
     cmd_go(argparse.Namespace())
@@ -69,7 +74,10 @@ def test_cmd_go_skips_historic_when_snapshots_exist(monkeypatch):
     monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
     monkeypatch.setattr(
         "workflow.cli.DuckDBStore",
-        lambda: types.SimpleNamespace(table_row_count=lambda _table: 10),
+        lambda: types.SimpleNamespace(
+            table_row_count=lambda _table: 10,
+            max_snapshot_time=lambda: "2099-01-01T00:00:00+00:00",
+        ),
     )
 
     cmd_go(argparse.Namespace(refresh_historic=False))
@@ -99,7 +107,10 @@ def test_cmd_go_refresh_historic_forces_download(monkeypatch):
     monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
     monkeypatch.setattr(
         "workflow.cli.DuckDBStore",
-        lambda: types.SimpleNamespace(table_row_count=lambda _table: 10),
+        lambda: types.SimpleNamespace(
+            table_row_count=lambda _table: 10,
+            max_snapshot_time=lambda: "2000-01-01T00:00:00+00:00",
+        ),
     )
 
     cmd_go(argparse.Namespace(refresh_historic=True))
@@ -107,6 +118,69 @@ def test_cmd_go_refresh_historic_forces_download(monkeypatch):
     assert executed == ["download-historic", "pipeline"]
     assert parsed_tokens[0][0] == "download-historic"
     assert parsed_tokens[1][0] == "pipeline"
+
+
+def test_cmd_go_runs_historic_when_snapshots_are_stale(monkeypatch):
+    parsed_tokens = []
+    executed = []
+
+    class _FakeParser:
+        """Capture parsed token lists and run synthetic command handlers."""
+
+        def parse_args(self, tokens):  # noqa: ANN001 - mirror argparse signature
+            parsed_tokens.append(list(tokens))
+            command = tokens[0]
+
+            def _runner(_args):  # noqa: ANN001 - mirror argparse callback signature
+                executed.append(command)
+
+            return argparse.Namespace(func=_runner)
+
+    monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(
+            table_row_count=lambda _table: 10,
+            max_snapshot_time=lambda: "2000-01-01T00:00:00+00:00",
+        ),
+    )
+
+    cmd_go(argparse.Namespace(refresh_historic=False, refresh_historic_if_stale_days=30))
+
+    assert executed == ["download-historic", "pipeline"]
+    assert parsed_tokens[0][0] == "download-historic"
+    assert parsed_tokens[1][0] == "pipeline"
+
+
+def test_cmd_go_disables_stale_refresh_when_threshold_negative(monkeypatch):
+    parsed_tokens = []
+    executed = []
+
+    class _FakeParser:
+        """Capture parsed token lists and run synthetic command handlers."""
+
+        def parse_args(self, tokens):  # noqa: ANN001 - mirror argparse signature
+            parsed_tokens.append(list(tokens))
+            command = tokens[0]
+
+            def _runner(_args):  # noqa: ANN001 - mirror argparse callback signature
+                executed.append(command)
+
+            return argparse.Namespace(func=_runner)
+
+    monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(
+            table_row_count=lambda _table: 10,
+            max_snapshot_time=lambda: "2000-01-01T00:00:00+00:00",
+        ),
+    )
+
+    cmd_go(argparse.Namespace(refresh_historic=False, refresh_historic_if_stale_days=-1))
+
+    assert executed == ["pipeline"]
+    assert parsed_tokens[0][0] == "pipeline"
 
 
 def test_parser_accepts_repair_manifests_command():
@@ -154,3 +228,4 @@ def test_parser_go_refresh_historic_default_is_false():
     parser = build_parser()
     args = parser.parse_args(["go"])
     assert args.refresh_historic is False
+    assert args.refresh_historic_if_stale_days == go_historic_stale_days_default()

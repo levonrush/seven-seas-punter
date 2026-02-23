@@ -461,6 +461,14 @@ class DuckDBStore:
             return None
         return result[0]
 
+    def max_snapshot_time(self) -> Optional[pd.Timestamp]:
+        """Return the latest snapshot timestamp so CLI workflows can detect stale historic data."""
+        with self._connect() as con:
+            result = con.execute("SELECT MAX(snapshot_time) FROM snapshots").fetchone()
+        if not result:
+            return None
+        return result[0]
+
     def table_row_count(self, table: str) -> int:
         """Return table row count so ingest steps can skip reprocessing when data already exists."""
         with self._connect() as con:

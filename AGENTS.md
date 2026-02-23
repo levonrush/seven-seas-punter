@@ -41,7 +41,10 @@ This file is guidance for automated agents working in this repository.
 - When adding new docs, add links from `docs/README.md` and keep cross-links up to date.
 
 ## Common commands
-- Download data: `punter download-historic --auto`.
+- Smart default run: `punter go` (skips historic download when snapshots are fresh; auto-refreshes when stale).
+- Force historic refresh: `punter go --refresh-historic`.
+- Download data directly: `punter download-historic --auto`.
+- Add new sport data: `punter download-historic --auto --sport "Greyhound Racing" --market-types ALL`.
 - Ingest: `punter ingest --archive data/data.tar`.
 - Full pipeline: `punter pipeline --cutoff-minutes 10`.
 - Train only: `punter train --cutoff-minutes 10`.
