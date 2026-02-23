@@ -36,6 +36,10 @@ def test_cmd_go_runs_historic_then_pipeline(monkeypatch):
             return argparse.Namespace(func=_runner)
 
     monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(table_row_count=lambda _table: 0),
+    )
 
     cmd_go(argparse.Namespace())
 
@@ -44,6 +48,65 @@ def test_cmd_go_runs_historic_then_pipeline(monkeypatch):
     assert parsed_tokens[0][1:] == go_historic_args()
     assert parsed_tokens[1][0] == "pipeline"
     assert parsed_tokens[1][1:] == go_pipeline_args()
+
+
+def test_cmd_go_skips_historic_when_snapshots_exist(monkeypatch):
+    parsed_tokens = []
+    executed = []
+
+    class _FakeParser:
+        """Capture parsed token lists and run synthetic command handlers."""
+
+        def parse_args(self, tokens):  # noqa: ANN001 - mirror argparse signature
+            parsed_tokens.append(list(tokens))
+            command = tokens[0]
+
+            def _runner(_args):  # noqa: ANN001 - mirror argparse callback signature
+                executed.append(command)
+
+            return argparse.Namespace(func=_runner)
+
+    monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(table_row_count=lambda _table: 10),
+    )
+
+    cmd_go(argparse.Namespace(refresh_historic=False))
+
+    assert executed == ["pipeline"]
+    assert len(parsed_tokens) == 1
+    assert parsed_tokens[0][0] == "pipeline"
+    assert parsed_tokens[0][1:] == go_pipeline_args()
+
+
+def test_cmd_go_refresh_historic_forces_download(monkeypatch):
+    parsed_tokens = []
+    executed = []
+
+    class _FakeParser:
+        """Capture parsed token lists and run synthetic command handlers."""
+
+        def parse_args(self, tokens):  # noqa: ANN001 - mirror argparse signature
+            parsed_tokens.append(list(tokens))
+            command = tokens[0]
+
+            def _runner(_args):  # noqa: ANN001 - mirror argparse callback signature
+                executed.append(command)
+
+            return argparse.Namespace(func=_runner)
+
+    monkeypatch.setattr("workflow.cli.build_parser", lambda: _FakeParser())
+    monkeypatch.setattr(
+        "workflow.cli.DuckDBStore",
+        lambda: types.SimpleNamespace(table_row_count=lambda _table: 10),
+    )
+
+    cmd_go(argparse.Namespace(refresh_historic=True))
+
+    assert executed == ["download-historic", "pipeline"]
+    assert parsed_tokens[0][0] == "download-historic"
+    assert parsed_tokens[1][0] == "pipeline"
 
 
 def test_parser_accepts_repair_manifests_command():
@@ -85,3 +148,9 @@ def test_parser_pipeline_has_decision_market_type_default():
     args = parser.parse_args(["pipeline"])
     assert args.market_types == "ALL"
     assert args.decision_market_types == "WIN"
+
+
+def test_parser_go_refresh_historic_default_is_false():
+    parser = build_parser()
+    args = parser.parse_args(["go"])
+    assert args.refresh_historic is False

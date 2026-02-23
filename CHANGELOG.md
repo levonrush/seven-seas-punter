@@ -3,6 +3,7 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- `punter go` now auto-skips `download-historic` when snapshots already exist in DuckDB, with `--refresh-historic` to force a fresh historic pull.
 - Hardened historic download manifest loading to recover from empty/corrupt JSON (with timestamped `.bad_*` backups) instead of crashing `punter go`.
 - Restricted `score`/`pub` feature generation to fetched market ids so daily scoring no longer re-scores historical markets.
 - Added backtest-style strategy filters (`min_ev`, `min_edge`, `max_spread`, `max_price`, `max_edge_mult`) to `score` output for train/backtest/score parity.
