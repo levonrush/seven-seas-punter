@@ -3,6 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+- Added default-on rescue guardrails for `backtest`/`score`/`pub`/`pipeline`/`go` with explicit opt-out (`--no-rescue-guards`): conservative strategy defaults (`min_ev=0.02`, `min_edge=0.01`, `max_price=30`, `max_edge_mult=1.2`) plus probability-tail safety (clip away from 0/1, market-anchored shrinkage, longshot caps).
+- Backtest engine now supports market-net commission settlement and reports `gross_profit` / `commission_paid`; rescue mode enables market-net commission automatically.
+- Hardened probability calibration/prediction paths to clip outputs away from exact 0/1 so downstream EV calculations cannot explode on tail artefacts.
 - Added `docs/form_intelligence_layer.md` to document the end-to-end P0/P1/P2 form-intelligence rollout, including rationale for different modeling approaches and leakage safeguards.
 - Enabled external-form integration by default across `features`/`train`/`backtest`/`score`/`pipeline`/`go`: commands now auto-ingest from common `data/` form files when `external_runner_form_runs` is empty, with explicit opt-out via `--no-external-form-ingest`.
 - Added P2 form-intelligence features in the builder: leakage-safe pre-race Plackett-Luce top-m hierarchical ratings (horse + jockey + trainer + context components), with `place_position` ordering when available and winner-only fallback when not.

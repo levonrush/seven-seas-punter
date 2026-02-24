@@ -33,6 +33,7 @@ DEFAULT_MARKET_TYPE_MIN_ROWS = 5000
 DEFAULT_CALIBRATION_RANDOMIZE_WITHIN_WINDOWS = True
 DEFAULT_CALIBRATION_WINDOW_SAMPLE_FRACTION = 0.8
 DEFAULT_CALIBRATION_RANDOM_STATE = 42
+DEFAULT_PROBABILITY_CLIP_EPSILON = 1e-6
 
 
 class ProbabilityCalibrator:
@@ -47,10 +48,19 @@ class ProbabilityCalibrator:
         """Transform raw probabilities into calibrated probabilities."""
         raw = np.asarray(raw_probs, dtype=float).reshape(-1)
         if self.method == "isotonic":
-            return self.calibrator.predict(raw)
+            return _clip_probabilities(self.calibrator.predict(raw))
         if self.method == "platt":
-            return self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+            return _clip_probabilities(self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1])
         raise ValueError(f"Unknown calibration method: {self.method}")
+
+
+def _clip_probabilities(
+    probs: np.ndarray | pd.Series,
+    epsilon: float = DEFAULT_PROBABILITY_CLIP_EPSILON,
+) -> np.ndarray:
+    """Keep probabilities strictly inside (0,1) so downstream EV cannot explode on exact tails."""
+    arr = np.asarray(probs, dtype=float).reshape(-1)
+    return np.clip(arr, epsilon, 1.0 - epsilon)
 
 
 def _require_lightgbm():
@@ -118,14 +128,15 @@ def _apply_plackett_luce(probs: pd.Series, market_ids: pd.Series) -> pd.Series:
 
 def _calibrate_probs(raw_probs: np.ndarray, calibrator, X: pd.DataFrame) -> np.ndarray:
     """Return calibrated probabilities given raw model output and optional calibrator."""
+    raw_probs = _clip_probabilities(raw_probs)
     if calibrator is None:
         return raw_probs
     if isinstance(calibrator, ProbabilityCalibrator):
-        return calibrator.calibrate(raw_probs)
+        return _clip_probabilities(calibrator.calibrate(raw_probs))
     if hasattr(calibrator, "predict_proba"):
-        return calibrator.predict_proba(X)[:, 1]
+        return _clip_probabilities(calibrator.predict_proba(X)[:, 1])
     if hasattr(calibrator, "predict"):
-        return calibrator.predict(raw_probs)
+        return _clip_probabilities(calibrator.predict(raw_probs))
     return raw_probs
 
 
@@ -616,16 +627,17 @@ def _fit_probability_calibrator(
     raw_probs: np.ndarray, y: pd.Series
 ) -> tuple[ProbabilityCalibrator, np.ndarray]:
     """Fit a calibrator on raw probabilities and return calibrated predictions."""
+    raw_probs = _clip_probabilities(raw_probs)
     try:
         isotonic = IsotonicRegression(out_of_bounds="clip")
         isotonic.fit(raw_probs, y)
-        calibrated = isotonic.predict(raw_probs)
+        calibrated = _clip_probabilities(isotonic.predict(raw_probs))
         return ProbabilityCalibrator("isotonic", isotonic), calibrated
     except Exception as exc:  # pragma: no cover - rare fallback
         log(f"Training: isotonic calibration failed ({exc}); falling back to Platt scaling.")
         platt = LogisticRegression(max_iter=200, solver="lbfgs")
         platt.fit(raw_probs.reshape(-1, 1), y)
-        calibrated = platt.predict_proba(raw_probs.reshape(-1, 1))[:, 1]
+        calibrated = _clip_probabilities(platt.predict_proba(raw_probs.reshape(-1, 1))[:, 1])
         return ProbabilityCalibrator("platt", platt), calibrated
 
 

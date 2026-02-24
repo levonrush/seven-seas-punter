@@ -143,7 +143,21 @@ punter pipeline --no-external-form-ingest
 ```
 
 ## Default Filter Behavior
-By default, `train`, `backtest`, `score`, `pipeline`, and `go` do not apply EV/edge/price/spread/min-prob strategy filters automatically.
+By default, `backtest`, `score`, `pipeline`, and `go` run with rescue guardrails enabled:
+- `min_ev=0.02`
+- `min_edge=0.01`
+- `max_price=30`
+- `max_edge_mult=1.2`
+- probability safety transform (clip away from 0/1, market anchoring, longshot cap)
+- backtest settlement uses market-net commission when rescue guards are enabled
+
+Disable these defaults explicitly when you want raw/off-policy experiments:
+```bash
+punter backtest --no-rescue-guards
+punter score --no-rescue-guards
+punter pipeline --no-rescue-guards
+punter go --no-rescue-guards
+```
 
 Enable filters explicitly when needed:
 ```bash

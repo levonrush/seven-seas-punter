@@ -8,7 +8,11 @@ sys.modules.setdefault(
     types.SimpleNamespace(DuckDBPyConnection=object, connect=lambda *args, **kwargs: None),
 )
 
-from workflow.cli import _apply_probability_thresholds, _apply_score_strategy_filters
+from workflow.cli import (
+    _apply_probability_thresholds,
+    _apply_score_strategy_filters,
+    _resolve_strategy_filter_values,
+)
 
 
 def test_apply_probability_thresholds_uses_bucket_specific_values_with_global_fallback():
@@ -45,6 +49,22 @@ def test_apply_score_strategy_filters_matches_backtest_style_constraints():
         max_price=200.0,
         max_edge_multiplier=5.0,
         max_spread=1.0,
+        apply_probability_safety=False,
     )
     assert len(filtered) == 1
     assert filtered.iloc[0]["p_hat"] == 0.60
+
+
+def test_rescue_strategy_defaults_apply_when_filters_not_explicitly_set():
+    args = types.SimpleNamespace(
+        min_ev=None,
+        min_edge=None,
+        max_price=None,
+        max_edge_mult=None,
+        rescue_guards=True,
+    )
+    min_ev, min_edge, max_price, max_edge_mult = _resolve_strategy_filter_values(args, "Test")
+    assert min_ev == 0.02
+    assert min_edge == 0.01
+    assert max_price == 30.0
+    assert max_edge_mult == 1.2

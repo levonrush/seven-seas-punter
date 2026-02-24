@@ -7,10 +7,45 @@ import pandas as pd
 from shared.utils.progress import log
 from shared.utils.bet_explain import annotate_preview_frame
 
+DEFAULT_PROBABILITY_CLIP_EPSILON = 1e-6
+DEFAULT_MARKET_ANCHOR_WEIGHT = 0.85
+DEFAULT_LONGSHOT_PRICE_FLOOR = 50.0
+DEFAULT_LONGSHOT_PROBABILITY_CAP = 0.10
+
 
 def compute_expected_value(prob: float, price: float, commission: float = 0.05) -> float:
     """Return unit-stake expected value given win probability, price, and commission."""
     return prob * (price - 1) * (1 - commission) - (1 - prob)
+
+
+def sanitize_probability_for_decision(
+    prob: float,
+    price: float,
+    clip_epsilon: float = DEFAULT_PROBABILITY_CLIP_EPSILON,
+    market_anchor_weight: float = DEFAULT_MARKET_ANCHOR_WEIGHT,
+    longshot_price_floor: float = DEFAULT_LONGSHOT_PRICE_FLOOR,
+    longshot_probability_cap: float = DEFAULT_LONGSHOT_PROBABILITY_CAP,
+) -> float:
+    """Return a conservative decision probability so tail artefacts cannot dominate EV."""
+    clipped_prob = min(max(float(prob), clip_epsilon), 1.0 - clip_epsilon)
+    safe_price = float(price)
+    if not math.isfinite(safe_price) or safe_price <= 1.0:
+        return clipped_prob
+
+    implied_prob = min(max(1.0 / safe_price, clip_epsilon), 1.0 - clip_epsilon)
+    bounded_anchor_weight = min(max(float(market_anchor_weight), 0.0), 1.0)
+    anchored_prob = (
+        bounded_anchor_weight * implied_prob + (1.0 - bounded_anchor_weight) * clipped_prob
+    )
+
+    safe_prob = anchored_prob
+    if safe_price >= float(longshot_price_floor):
+        bounded_cap = min(
+            max(float(longshot_probability_cap), clip_epsilon),
+            1.0 - clip_epsilon,
+        )
+        safe_prob = min(safe_prob, bounded_cap)
+    return min(max(float(safe_prob), clip_epsilon), 1.0 - clip_epsilon)
 
 
 def _select_price(feature_row: pd.Series, cutoff_minutes: int) -> float | None:
@@ -23,6 +58,66 @@ def _select_price(feature_row: pd.Series, cutoff_minutes: int) -> float | None:
         if pd.notnull(val):
             return val
     return None
+
+
+def _apply_market_net_commission(bet_df: pd.DataFrame, commission: float) -> pd.DataFrame:
+    """Apply commission on net positive market profit and allocate it across winning bets."""
+    settled = bet_df.copy()
+    settled["gross_profit"] = settled.apply(_compute_gross_profit, axis=1)
+    if commission <= 0:
+        settled["market_gross_profit"] = settled.groupby("market_id")["gross_profit"].transform("sum")
+        settled["market_commission"] = 0.0
+        settled["commission_paid"] = 0.0
+        settled["profit"] = settled["gross_profit"]
+        return settled
+
+    settled["market_gross_profit"] = settled.groupby("market_id")["gross_profit"].transform("sum")
+    settled["market_commission"] = settled["market_gross_profit"].clip(lower=0.0) * float(commission)
+    settled["commission_paid"] = 0.0
+
+    positive_mask = settled["gross_profit"] > 0
+    positive_market_total = (
+        settled["gross_profit"]
+        .where(positive_mask, 0.0)
+        .groupby(settled["market_id"])
+        .transform("sum")
+    )
+    alloc_mask = positive_mask & (positive_market_total > 0)
+    settled.loc[alloc_mask, "commission_paid"] = (
+        settled.loc[alloc_mask, "market_commission"]
+        * settled.loc[alloc_mask, "gross_profit"]
+        / positive_market_total.loc[alloc_mask]
+    )
+    settled["profit"] = settled["gross_profit"] - settled["commission_paid"]
+    return settled
+
+
+def _compute_gross_profit(row: pd.Series) -> float:
+    """Compute gross settled profit for one back bet, including optional reduction/dead-heat fields."""
+    stake = float(row["stake"])
+    price = float(row["price"])
+    reduction_factor = row.get("reduction_factor")
+    if reduction_factor is not None and pd.notnull(reduction_factor):
+        bounded_rf = min(max(float(reduction_factor), 0.0), 1.0)
+        price = 1.0 + (price - 1.0) * (1.0 - bounded_rf)
+
+    if not row.get("win_flag"):
+        return -stake
+
+    win_fraction = row.get("win_fraction")
+    if win_fraction is None or not isinstance(win_fraction, (int, float)) or not math.isfinite(float(win_fraction)):
+        dead_heat_divisor = row.get("dead_heat_divisor")
+        if (
+            dead_heat_divisor is not None
+            and isinstance(dead_heat_divisor, (int, float))
+            and math.isfinite(float(dead_heat_divisor))
+            and float(dead_heat_divisor) > 0.0
+        ):
+            win_fraction = 1.0 / float(dead_heat_divisor)
+        else:
+            win_fraction = 1.0
+    bounded_win_fraction = min(max(float(win_fraction), 0.0), 1.0)
+    return stake * (price - 1.0) * bounded_win_fraction
 
 
 def run_backtest(
@@ -39,9 +134,15 @@ def run_backtest(
     stake: float = 1.0,
     max_bets_per_day: int | None = None,
     max_exposure_per_race: float | None = None,
+    commission_mode: str = "per_bet",
+    apply_probability_safety: bool = True,
+    market_anchor_weight: float = DEFAULT_MARKET_ANCHOR_WEIGHT,
+    longshot_price_floor: float = DEFAULT_LONGSHOT_PRICE_FLOOR,
+    longshot_probability_cap: float = DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    probability_clip_epsilon: float = DEFAULT_PROBABILITY_CLIP_EPSILON,
     quiet: bool = False,
 ) -> tuple[pd.DataFrame, dict]:
-    """Simulate a simple value strategy with optional filters and risk controls."""
+    """Simulate a value strategy with optional filters, risk controls, and settlement modes."""
     if feature_df.empty or probs.empty:
         if not quiet:
             log("Backtest: empty features or probabilities; skipping.")
@@ -70,6 +171,17 @@ def run_backtest(
             continue
         if not isinstance(prob, (int, float)) or not math.isfinite(float(prob)):
             continue
+        if apply_probability_safety:
+            prob = sanitize_probability_for_decision(
+                prob=float(prob),
+                price=float(price),
+                clip_epsilon=probability_clip_epsilon,
+                market_anchor_weight=market_anchor_weight,
+                longshot_price_floor=longshot_price_floor,
+                longshot_probability_cap=longshot_probability_cap,
+            )
+        else:
+            prob = min(max(float(prob), probability_clip_epsilon), 1.0 - probability_clip_epsilon)
         if max_price is not None and price > max_price:
             continue
         ev = compute_expected_value(prob, price, commission)
@@ -103,6 +215,9 @@ def run_backtest(
                 "stake": stake,
                 "race_start_time": row["race_start_time"],
                 "win_flag": row.get("win_target"),
+                "reduction_factor": row.get("reduction_factor"),
+                "dead_heat_divisor": row.get("dead_heat_divisor"),
+                "win_fraction": row.get("win_fraction"),
             }
         )
 
@@ -125,15 +240,25 @@ def run_backtest(
     bet_df["bet_time"] = pd.to_datetime(bet_df["race_start_time"]) - pd.to_timedelta(cutoff_minutes, unit="m")
     bet_df["bet_type"] = "BACK"
     bet_df["commission_rate"] = commission
+    bet_df["commission_mode"] = commission_mode
     bet_df["expected_profit"] = bet_df["expected_value"] * bet_df["stake"]
     stake_sum = bet_df["stake"].sum()
-    bet_df["profit"] = bet_df.apply(
-        lambda r: r["stake"] * (r["price"] - 1) * (1 - commission) if r.get("win_flag") else -r["stake"],
-        axis=1,
-    )
+    commission_mode_normalized = str(commission_mode).strip().lower()
+    if commission_mode_normalized == "market_net":
+        bet_df = _apply_market_net_commission(bet_df, commission=commission)
+    elif commission_mode_normalized == "per_bet":
+        bet_df["gross_profit"] = bet_df.apply(_compute_gross_profit, axis=1)
+        bet_df["market_gross_profit"] = bet_df.groupby("market_id")["gross_profit"].transform("sum")
+        bet_df["commission_paid"] = bet_df["gross_profit"].clip(lower=0.0) * float(commission)
+        bet_df["market_commission"] = bet_df.groupby("market_id")["commission_paid"].transform("sum")
+        bet_df["profit"] = bet_df["gross_profit"] - bet_df["commission_paid"]
+    else:
+        raise ValueError("commission_mode must be either 'per_bet' or 'market_net'.")
     bet_df["result_profit"] = bet_df["profit"]
     profit = bet_df["profit"].sum()
     expected_profit = bet_df["expected_profit"].sum()
+    gross_profit = bet_df["gross_profit"].sum()
+    commission_paid = bet_df["commission_paid"].sum()
     wins = (bet_df["win_flag"] == 1).sum() if "win_flag" in bet_df else 0
     hit_rate = wins / len(bet_df) if len(bet_df) else 0
     roi = profit / stake_sum if stake_sum else 0
@@ -165,6 +290,8 @@ def run_backtest(
         "bets": len(bet_df),
         "profit": float(profit),
         "expected_profit": float(expected_profit),
+        "gross_profit": float(gross_profit),
+        "commission_paid": float(commission_paid),
         "turnover": float(stake_sum),
         "roi": float(roi),
         "expected_roi": float(expected_roi),
@@ -174,6 +301,7 @@ def run_backtest(
         "prob_gap": float(prob_gap),
         "max_drawdown": float(max_drawdown),
         "avg_price_improvement": float(price_improvement) if price_improvement is not None else None,
+        "commission_mode": commission_mode_normalized,
     }
 
     if not quiet:

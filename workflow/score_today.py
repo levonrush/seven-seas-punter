@@ -4,7 +4,14 @@ import pathlib
 
 import pandas as pd
 
-from shared.backtest.engine import compute_expected_value
+from shared.backtest.engine import (
+    DEFAULT_LONGSHOT_PRICE_FLOOR,
+    DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    DEFAULT_MARKET_ANCHOR_WEIGHT,
+    DEFAULT_PROBABILITY_CLIP_EPSILON,
+    compute_expected_value,
+    sanitize_probability_for_decision,
+)
 from shared.betfair.client import BetfairClient
 from shared.features.builder import SNAPSHOT_OFFSETS_MIN, build_features_from_store
 from shared.model.training import load_model_and_calibrator, predict_probabilities
@@ -76,6 +83,17 @@ def main() -> None:
             log("No rows remain after min_prob filter.")
             return
     price_col = f"back_price_t{args.cutoff_minutes}"
+    features["p_hat"] = features.apply(
+        lambda row: sanitize_probability_for_decision(
+            prob=float(row["p_hat"]),
+            price=float(row.get(price_col) or row.get("back_price_t10") or 0.0),
+            clip_epsilon=DEFAULT_PROBABILITY_CLIP_EPSILON,
+            market_anchor_weight=DEFAULT_MARKET_ANCHOR_WEIGHT,
+            longshot_price_floor=DEFAULT_LONGSHOT_PRICE_FLOOR,
+            longshot_probability_cap=DEFAULT_LONGSHOT_PROBABILITY_CAP,
+        ),
+        axis=1,
+    )
     features["ev"] = features.apply(
         lambda r: compute_expected_value(
             prob=r["p_hat"], price=r.get(price_col) or r.get("back_price_t10") or 0.0

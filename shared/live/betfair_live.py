@@ -8,7 +8,14 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from shared.backtest.engine import compute_expected_value
+from shared.backtest.engine import (
+    DEFAULT_LONGSHOT_PRICE_FLOOR,
+    DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    DEFAULT_MARKET_ANCHOR_WEIGHT,
+    DEFAULT_PROBABILITY_CLIP_EPSILON,
+    compute_expected_value,
+    sanitize_probability_for_decision,
+)
 from shared.betfair.client import BetfairClient
 from shared.features.builder import TICK_LADDER, build_features_from_store
 from shared.model.training import load_model_and_calibrator, predict_probabilities
@@ -281,6 +288,17 @@ def build_candidate_bets(
         if scored.empty:
             return pd.DataFrame()
 
+    scored["p_hat"] = scored.apply(
+        lambda row: sanitize_probability_for_decision(
+            prob=float(row["p_hat"]),
+            price=float(row["price"]),
+            clip_epsilon=DEFAULT_PROBABILITY_CLIP_EPSILON,
+            market_anchor_weight=DEFAULT_MARKET_ANCHOR_WEIGHT,
+            longshot_price_floor=DEFAULT_LONGSHOT_PRICE_FLOOR,
+            longshot_probability_cap=DEFAULT_LONGSHOT_PROBABILITY_CAP,
+        ),
+        axis=1,
+    )
     scored["implied_prob"] = 1.0 / scored["price"]
     scored["edge_pct"] = (scored["p_hat"] - scored["implied_prob"]) / scored["implied_prob"]
     scored["expected_value"] = scored.apply(

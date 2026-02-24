@@ -43,6 +43,7 @@ def test_prediction_preview_keeps_market_type_with_overlapping_market_columns():
         max_edge_multiplier=5.0,
         per_market_limit=1,
         min_prob=0.35,
+        apply_probability_safety=False,
     )
 
     assert len(preview) == 1
@@ -88,6 +89,7 @@ def test_prediction_preview_backfills_market_type_from_market_table():
         max_edge_multiplier=5.0,
         per_market_limit=1,
         min_prob=0.35,
+        apply_probability_safety=False,
     )
 
     assert len(preview) == 1

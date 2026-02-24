@@ -21,7 +21,7 @@ This runs:
 - if snapshots are stale (default: older than 30 days), it refreshes historic data automatically;
 - `--refresh-historic` always forces download;
 - `--refresh-historic-if-stale-days N` changes the stale threshold (negative disables stale auto-refresh).
-- `train/backtest/score` steps run with strategy thresholds disabled by default; pass filter flags explicitly when needed.
+- `backtest/score/pipeline/go` now run with conservative rescue guardrails by default (including market-net commission settlement in backtests); disable with `--no-rescue-guards` when running raw experiments.
 
 Full pipeline (ingest -> features -> train -> backtest -> score -> report):
 ```bash

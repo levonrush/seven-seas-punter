@@ -7,7 +7,16 @@ import uuid
 import pandas as pd
 
 from shared.backtest.allocation import allocate_stakes_from_budget, summarize_budget_usage
-from shared.backtest.engine import build_bet_preview, run_backtest
+from shared.backtest.engine import (
+    DEFAULT_LONGSHOT_PRICE_FLOOR,
+    DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    DEFAULT_MARKET_ANCHOR_WEIGHT,
+    DEFAULT_PROBABILITY_CLIP_EPSILON,
+    build_bet_preview,
+    compute_expected_value,
+    run_backtest,
+    sanitize_probability_for_decision,
+)
 from shared.backtest.strategy_tuner import tune_strategy
 from shared.betfair.client import BetfairClient
 from shared.form.ingest import load_external_form_rows
@@ -49,6 +58,11 @@ DEFAULT_EXTERNAL_FORM_INPUT_CANDIDATES = (
     pathlib.Path("data/external_form_runs.jsonl"),
     pathlib.Path("data/external_form.json"),
 )
+DEFAULT_RESCUE_GUARDS_ENABLED = True
+DEFAULT_RESCUE_MIN_EV = 0.02
+DEFAULT_RESCUE_MIN_EDGE = 0.01
+DEFAULT_RESCUE_MAX_PRICE = 30.0
+DEFAULT_RESCUE_MAX_EDGE_MULTIPLIER = 1.20
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -474,11 +488,42 @@ def _apply_score_strategy_filters(
     max_price: float | None,
     max_edge_multiplier: float | None,
     max_spread: float | None,
+    commission: float = 0.05,
+    apply_probability_safety: bool = DEFAULT_RESCUE_GUARDS_ENABLED,
+    market_anchor_weight: float = DEFAULT_MARKET_ANCHOR_WEIGHT,
+    longshot_price_floor: float = DEFAULT_LONGSHOT_PRICE_FLOOR,
+    longshot_probability_cap: float = DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    probability_clip_epsilon: float = DEFAULT_PROBABILITY_CLIP_EPSILON,
 ) -> pd.DataFrame:
     """Apply backtest-style EV/edge/price/spread filters so score output matches strategy assumptions."""
     if frame.empty:
         return frame
     filtered = frame.copy()
+    if apply_probability_safety:
+        filtered["p_hat"] = filtered.apply(
+            lambda row: sanitize_probability_for_decision(
+                prob=float(row["p_hat"]),
+                price=float(row["decision_price"]),
+                clip_epsilon=probability_clip_epsilon,
+                market_anchor_weight=market_anchor_weight,
+                longshot_price_floor=longshot_price_floor,
+                longshot_probability_cap=longshot_probability_cap,
+            ),
+            axis=1,
+        )
+    else:
+        filtered["p_hat"] = filtered["p_hat"].clip(
+            lower=probability_clip_epsilon,
+            upper=1.0 - probability_clip_epsilon,
+        )
+    filtered["ev"] = filtered.apply(
+        lambda row: compute_expected_value(
+            prob=float(row["p_hat"]),
+            price=float(row["decision_price"]),
+            commission=float(commission),
+        ),
+        axis=1,
+    )
     filtered["implied_prob"] = 1.0 / filtered["decision_price"]
     filtered["edge_pct"] = (filtered["p_hat"] - filtered["implied_prob"]) / filtered["implied_prob"]
     filtered["edge_multiplier"] = filtered["p_hat"] / filtered["implied_prob"]
@@ -497,6 +542,36 @@ def _apply_score_strategy_filters(
         filtered = filtered[filtered[spread_col].isna() | (filtered[spread_col] <= max_spread)]
     log(f"Score: strategy filters kept {len(filtered)}/{before} rows.")
     return filtered
+
+
+def _resolve_strategy_filter_values(
+    args: argparse.Namespace,
+    label: str,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Resolve strategy filters with default-on rescue guardrails unless explicitly disabled."""
+    min_ev = getattr(args, "min_ev", None)
+    min_edge = getattr(args, "min_edge", None)
+    max_price = getattr(args, "max_price", None)
+    max_edge_mult = getattr(args, "max_edge_mult", None)
+
+    if not getattr(args, "rescue_guards", DEFAULT_RESCUE_GUARDS_ENABLED):
+        return min_ev, min_edge, max_price, max_edge_mult
+
+    if min_ev is None:
+        min_ev = DEFAULT_RESCUE_MIN_EV
+    if min_edge is None:
+        min_edge = DEFAULT_RESCUE_MIN_EDGE
+    if max_price is None:
+        max_price = DEFAULT_RESCUE_MAX_PRICE
+    if max_edge_mult is None:
+        max_edge_mult = DEFAULT_RESCUE_MAX_EDGE_MULTIPLIER
+
+    log(
+        f"{label}: rescue guards active "
+        f"(min_ev={float(min_ev):.3f}, min_edge={float(min_edge):.3f}, "
+        f"max_price={float(max_price):.1f}, max_edge_mult={float(max_edge_mult):.2f})."
+    )
+    return min_ev, min_edge, max_price, max_edge_mult
 
 
 def _resolve_execution_domain(args: argparse.Namespace) -> str:
@@ -796,18 +871,27 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         return
     features = prediction_frame.drop(columns=["p_hat"])
     probs = prediction_frame["p_hat"]
+    min_ev, min_edge, max_price, max_edge_mult = _resolve_strategy_filter_values(args, "Backtest")
+    commission_mode = "market_net" if getattr(args, "rescue_guards", DEFAULT_RESCUE_GUARDS_ENABLED) else "per_bet"
+    log(f"Backtest: commission mode={commission_mode}.")
     bets, metrics = run_backtest(
         feature_df=features,
         probs=probs,
         cutoff_minutes=args.cutoff_minutes,
         commission=args.commission,
-        min_ev=args.min_ev,
-        min_edge=args.min_edge,
+        min_ev=min_ev,
+        min_edge=min_edge,
         max_spread=args.max_spread,
-        max_price=args.max_price,
-        max_edge_multiplier=args.max_edge_mult,
+        max_price=max_price,
+        max_edge_multiplier=max_edge_mult,
         min_prob=None,
         stake=args.stake,
+        commission_mode=commission_mode,
+        apply_probability_safety=getattr(args, "rescue_guards", DEFAULT_RESCUE_GUARDS_ENABLED),
+        market_anchor_weight=DEFAULT_MARKET_ANCHOR_WEIGHT,
+        longshot_price_floor=DEFAULT_LONGSHOT_PRICE_FLOOR,
+        longshot_probability_cap=DEFAULT_LONGSHOT_PROBABILITY_CAP,
+        probability_clip_epsilon=DEFAULT_PROBABILITY_CLIP_EPSILON,
     )
     store.record_bets(bets.to_dict(orient="records"), run_id=getattr(args, "run_id", None))
     log(f"Backtest metrics: {metrics}")
@@ -827,7 +911,6 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 def cmd_score(args: argparse.Namespace) -> None:
     """Score today's markets and write CSV report."""
     print(f"Scoring today (cutoff T-{args.cutoff_minutes})...")
-    from shared.backtest.engine import compute_expected_value
     from workflow.score_today import _capture_latest_snapshots
 
     today = dt.date.today()
@@ -944,22 +1027,21 @@ def cmd_score(args: argparse.Namespace) -> None:
         log(f"Score: no rows with decision prices ({len(features)}/{before_decision} rows).")
         return
 
-    features["ev"] = features.apply(
-        lambda row: compute_expected_value(
-            prob=float(row["p_hat"]),
-            price=float(row["decision_price"]),
-            commission=commission_rate,
-        ),
-        axis=1,
-    )
+    min_ev, min_edge, max_price, max_edge_mult = _resolve_strategy_filter_values(args, "Score")
     features = _apply_score_strategy_filters(
         frame=features,
         cutoff_minutes=args.cutoff_minutes,
-        min_ev=getattr(args, "min_ev", None),
-        min_edge=getattr(args, "min_edge", None),
-        max_price=getattr(args, "max_price", None),
-        max_edge_multiplier=getattr(args, "max_edge_mult", None),
+        min_ev=min_ev,
+        min_edge=min_edge,
+        max_price=max_price,
+        max_edge_multiplier=max_edge_mult,
         max_spread=getattr(args, "max_spread", None),
+        commission=commission_rate,
+        apply_probability_safety=getattr(args, "rescue_guards", DEFAULT_RESCUE_GUARDS_ENABLED),
+        market_anchor_weight=DEFAULT_MARKET_ANCHOR_WEIGHT,
+        longshot_price_floor=DEFAULT_LONGSHOT_PRICE_FLOOR,
+        longshot_probability_cap=DEFAULT_LONGSHOT_PROBABILITY_CAP,
+        probability_clip_epsilon=DEFAULT_PROBABILITY_CLIP_EPSILON,
     )
     if features.empty:
         log("Score: no rows remain after strategy filters.")
@@ -1407,6 +1489,8 @@ def cmd_go(args: argparse.Namespace) -> None:
     pipeline_tokens = ["pipeline", *go_pipeline_args()]
     if not getattr(args, "external_form_ingest", True):
         pipeline_tokens.append("--no-external-form-ingest")
+    if not getattr(args, "rescue_guards", DEFAULT_RESCUE_GUARDS_ENABLED):
+        pipeline_tokens.append("--no-rescue-guards")
 
     external_form_input = getattr(args, "external_form_input", None)
     if external_form_input:
@@ -1506,6 +1590,19 @@ def _add_external_form_auto_ingest_arguments(parser: argparse.ArgumentParser) ->
     parser.add_argument(
         "--external-form-default-snapshot-time",
         help="Fallback snapshot timestamp (ISO) used by auto external-form ingestion when missing in rows.",
+    )
+
+
+def _add_rescue_guard_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach default-on rescue controls with a clear opt-out switch."""
+    parser.add_argument(
+        "--rescue-guards",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RESCUE_GUARDS_ENABLED,
+        help=(
+            "Enable conservative rescue guardrails (default): sparse strategy defaults and "
+            "probability safety transforms. Disable with --no-rescue-guards."
+        ),
     )
 
 
@@ -1890,6 +1987,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print a preview of top bets after backtest.",
     )
     p_bt.add_argument("--bets-limit", type=int, default=20, help="Rows to show in bet preview.")
+    _add_rescue_guard_arguments(p_bt)
     _add_external_form_auto_ingest_arguments(p_bt)
     p_bt.set_defaults(func=cmd_backtest)
 
@@ -1971,6 +2069,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_rescue_guard_arguments(p_score)
     _add_external_form_auto_ingest_arguments(p_score)
     _add_execution_domain_arguments(p_score, default_execution_domain="betfair")
     p_score.set_defaults(func=cmd_score)
@@ -2015,6 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.2,
         help="Max stake per bet as a fraction of daily budget.",
     )
+    _add_rescue_guard_arguments(p_pub)
     _add_external_form_auto_ingest_arguments(p_pub)
     _add_execution_domain_arguments(p_pub, default_execution_domain="tab")
     p_pub.set_defaults(func=cmd_pub)
@@ -2329,6 +2429,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pipe.add_argument("--skip-train", action="store_true")
     p_pipe.add_argument("--skip-backtest", action="store_true")
     p_pipe.add_argument("--skip-score", action="store_true")
+    _add_rescue_guard_arguments(p_pipe)
     _add_external_form_auto_ingest_arguments(p_pipe)
     p_pipe.set_defaults(func=cmd_pipeline)
 
@@ -2351,6 +2452,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(set negative to disable stale-data auto-refresh)."
         ),
     )
+    _add_rescue_guard_arguments(p_go)
     _add_external_form_auto_ingest_arguments(p_go)
     p_go.set_defaults(func=cmd_go)
 

@@ -8,6 +8,7 @@ The backtest engine simulates a simple value strategy using model probabilities.
 - Apply optional risk controls (max bets per day, max exposure per race).
 - The CLI prefers out-of-fold predictions for in-sample backtests to reduce optimism bias.
 - When `market_type` is present, the CLI filters to WIN markets to keep targets consistent.
+- Commission settlement supports `per_bet` and `market_net` modes; rescue mode defaults to market-net.
 
 If `min_prob` is unset, the CLI will use the tuned `kappa_threshold` from the latest model run.
 

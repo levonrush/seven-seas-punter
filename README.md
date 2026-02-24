@@ -54,7 +54,7 @@ punter go
 - skips historic download when snapshots are fresh enough;
 - auto-refreshes when snapshots are stale (default: older than 30 days);
 - force refresh anytime with `punter go --refresh-historic`.
-- leaves strategy filters/tuning off by default (enable explicitly with command flags when desired).
+- enables conservative rescue guardrails by default for decisioning (`min_ev`, `min_edge`, `max_price`, edge-mult cap, plus probability tail safety); disable with `--no-rescue-guards` when running experiments.
 
 Use `punter <command> --help` to tune any step (`download-historic`, `pipeline`, `live`, etc.).
 

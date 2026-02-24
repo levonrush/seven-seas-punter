@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 
-from shared.backtest.engine import compute_expected_value
+from shared.backtest.engine import (
+    DEFAULT_LONGSHOT_PRICE_FLOOR,
+    DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    DEFAULT_MARKET_ANCHOR_WEIGHT,
+    DEFAULT_PROBABILITY_CLIP_EPSILON,
+    compute_expected_value,
+    sanitize_probability_for_decision,
+)
 from shared.utils.bet_explain import annotate_preview_frame
 
 
@@ -44,6 +51,11 @@ def build_prediction_preview(
     per_market_limit: int | None = 1,
     commission: float = 0.05,
     min_prob: float | None = None,
+    apply_probability_safety: bool = True,
+    market_anchor_weight: float = DEFAULT_MARKET_ANCHOR_WEIGHT,
+    longshot_price_floor: float = DEFAULT_LONGSHOT_PRICE_FLOOR,
+    longshot_probability_cap: float = DEFAULT_LONGSHOT_PROBABILITY_CAP,
+    probability_clip_epsilon: float = DEFAULT_PROBABILITY_CLIP_EPSILON,
 ) -> pd.DataFrame:
     """Create a human-readable preview of top predictions for sanity checking."""
     if feature_df.empty or probs.empty:
@@ -57,6 +69,23 @@ def build_prediction_preview(
     preview = preview[preview["price"] > 0]
     if preview.empty:
         return pd.DataFrame()
+    if apply_probability_safety:
+        preview["p_hat"] = preview.apply(
+            lambda row: sanitize_probability_for_decision(
+                prob=float(row["p_hat"]),
+                price=float(row["price"]),
+                clip_epsilon=probability_clip_epsilon,
+                market_anchor_weight=market_anchor_weight,
+                longshot_price_floor=longshot_price_floor,
+                longshot_probability_cap=longshot_probability_cap,
+            ),
+            axis=1,
+        )
+    else:
+        preview["p_hat"] = preview["p_hat"].clip(
+            lower=probability_clip_epsilon,
+            upper=1.0 - probability_clip_epsilon,
+        )
     if min_prob is not None:
         preview = preview[preview["p_hat"] >= min_prob]
         if preview.empty:
